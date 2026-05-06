@@ -2,8 +2,12 @@
 Sweep multiple fusion configurations without reloading the pipeline.
 
 The pipeline and images are loaded once.  Per-view sparse diffusion runs are
-cached per ``samples_per_view`` value, so every config that shares the same
+cached per ``samples_per_view`` value so every config that shares the same
 ``samples_per_view`` reuses the already-computed logit tensors.
+
+For SLAT fusion configs, per-view shape SLAT tensors are also cached keyed
+by the sparse coords result — so sweeping different ``slat_fusion_mode``
+values on identical coords costs only one extra SLAT diffusion pass per view.
 
 Modes
 -----
@@ -15,8 +19,7 @@ Default (full pipeline):
     Skips shape/texture SLAT and GLB export entirely.
     Only computes and fuses the sparse occupancy logits.
     The entire sweep (8+ configs) finishes in ~20s after the shared
-    sparse diffusion run.  Use this to quickly compare voxel counts
-    across fusion strategies before committing to a full run.
+    sparse diffusion run.  Use for rapid occupancy exploration.
 
 Config format (--configs path/to/configs.json)
 ----------------------------------------------
@@ -24,14 +27,14 @@ A JSON array of objects.  All keys are optional; unset keys fall back to
 their CLI defaults.
 
     [
-      {"label": "union",          "fusion": "union"},
-      {"label": "lm",             "fusion": "logit-mean"},
-      {"label": "lm+sm0.8",       "fusion": "logit-mean", "logit_smooth_sigma": 0.8},
-      {"label": "lm+fn2",         "fusion": "logit-mean", "filter_min_neighbors": 2},
-      {"label": "lmax",           "fusion": "logit-max"},
-      {"label": "lsum",           "fusion": "logit-sum"},
-      {"label": "vote33",         "fusion": "vote",       "vote_threshold": 0.33},
-      {"label": "lm+spv3",        "fusion": "logit-mean", "samples_per_view": 3}
+      {"label": "union",               "fusion": "union"},
+      {"label": "lm",                  "fusion": "logit-mean"},
+      {"label": "lm+sm0.8",            "fusion": "logit-mean", "logit_smooth_sigma": 0.8},
+      {"label": "lm+slat-mean",        "fusion": "logit-mean", "slat_fusion_mode": "slat-mean"},
+      {"label": "lm+slat-nw",          "fusion": "logit-mean", "slat_fusion_mode": "slat-norm-weighted"},
+      {"label": "vote33",              "fusion": "vote",        "vote_threshold": 0.33},
+      {"label": "lm+spv3+slat-mean",   "fusion": "logit-mean", "samples_per_view": 3,
+                                        "slat_fusion_mode": "slat-mean"}
     ]
 
 Examples
@@ -40,13 +43,17 @@ Examples
 python scripts/sweep_fusion.py front-left-top.png back-right.png front-left.png \\
     --sparse-only --output-dir ./out
 
-# Full sweep (GLB per config):
+# Full sweep — sparse fusion only, primary SLAT:
 python scripts/sweep_fusion.py front-left-top.png back-right.png front-left.png \\
     --output-dir ./out
 
+# Full sweep — all configs use logit-mean sparse + slat-mean SLAT fusion:
+python scripts/sweep_fusion.py front-left-top.png back-right.png front-left.png \\
+    --slat-fusion slat-mean --output-dir ./out
+
 # Custom config list:
 python scripts/sweep_fusion.py front-left-top.png back-right.png front-left.png \\
-    --configs my_configs.json --sparse-only --output-dir ./out
+    --configs my_configs.json --output-dir ./out
 """
 
 import argparse
@@ -75,18 +82,22 @@ from trellis2.pipelines import Trellis2ImageTo3DPipeline
 # ---------------------------------------------------------------------------
 
 DEFAULT_CONFIGS = [
+    # --- Sparse fusion baselines (primary-only SLAT) ---
     {"label": "union",              "fusion": "union"},
     {"label": "union+fn2",          "fusion": "union",       "filter_min_neighbors": 2},
     {"label": "vote-33",            "fusion": "vote",        "vote_threshold": 0.33},
     {"label": "logit-mean",         "fusion": "logit-mean"},
     {"label": "logit-max",          "fusion": "logit-max"},
-    {"label": "logit-sum",          "fusion": "logit-sum"},
     {"label": "logit-mean+sm0.5",   "fusion": "logit-mean",  "logit_smooth_sigma": 0.5},
     {"label": "logit-mean+sm0.8",   "fusion": "logit-mean",  "logit_smooth_sigma": 0.8},
-    {"label": "logit-mean+sm1.2",   "fusion": "logit-mean",  "logit_smooth_sigma": 1.2},
     {"label": "logit-mean+fn2",     "fusion": "logit-mean",  "filter_min_neighbors": 2},
-    {"label": "logit-max+sm0.8",    "fusion": "logit-max",   "logit_smooth_sigma": 0.8},
-    {"label": "logit-mean+thr-0.5", "fusion": "logit-mean",  "logit_threshold": -0.5},
+    # --- SLAT feature fusion (logit-mean sparse + varying SLAT mode) ---
+    {"label": "lm+slat-mean",       "fusion": "logit-mean",  "slat_fusion_mode": "slat-mean"},
+    {"label": "lm+slat-nw",         "fusion": "logit-mean",  "slat_fusion_mode": "slat-norm-weighted"},
+    {"label": "lm+slat-max",        "fusion": "logit-mean",  "slat_fusion_mode": "slat-max"},
+    # --- Combined: best sparse + best SLAT ---
+    {"label": "lm+sm0.8+slat-mean", "fusion": "logit-mean",  "logit_smooth_sigma": 0.8,
+                                     "slat_fusion_mode": "slat-mean"},
 ]
 
 # ---------------------------------------------------------------------------
@@ -120,6 +131,8 @@ def make_label(cfg: dict) -> str:
         parts.append(f"fn{cfg['filter_min_neighbors']}")
     if cfg.get("samples_per_view", 1) > 1:
         parts.append(f"spv{cfg['samples_per_view']}")
+    if cfg.get("slat_fusion_mode", "primary") != "primary":
+        parts.append(cfg["slat_fusion_mode"])
     return "+".join(parts)
 
 
@@ -227,6 +240,20 @@ def parse_args() -> argparse.Namespace:
              "exploration.",
     )
     parser.add_argument(
+        "--slat-fusion",
+        choices=["primary", "slat-mean", "slat-norm-weighted", "slat-max"],
+        default=None,
+        metavar="MODE",
+        help=(
+            "Override the SLAT fusion mode for ALL configs in the sweep.  "
+            "When set, this overrides any per-config 'slat_fusion_mode' key.  "
+            "'primary' = use only the first image's conditioning (default).  "
+            "'slat-mean' = average 32-ch feature vectors across views.  "
+            "'slat-norm-weighted' = weight by per-token feature norm.  "
+            "'slat-max' = element-wise maximum across views."
+        ),
+    )
+    parser.add_argument(
         "--pipeline",
         choices=["512", "1024", "1024_cascade", "1536_cascade"],
         default="1024_cascade",
@@ -266,6 +293,10 @@ def main() -> None:
         cfg.setdefault("logit_smooth_sigma", 0.0)
         cfg.setdefault("samples_per_view", 1)
         cfg.setdefault("filter_min_neighbors", 0)
+        cfg.setdefault("slat_fusion_mode", "primary")
+        # CLI --slat-fusion overrides per-config value
+        if args.slat_fusion is not None:
+            cfg["slat_fusion_mode"] = args.slat_fusion
         if "label" not in cfg:
             cfg["label"] = make_label(cfg)
 
@@ -306,6 +337,18 @@ def main() -> None:
     conds_512 = [pipeline.get_cond([img], 512) for img in images]
     cond_512_primary  = conds_512[0]
     cond_1024_primary = pipeline.get_cond([images[0]], 1024) if pipeline_type != "512" else None
+
+    # Pre-compute per-view 1024-px conds if any config uses SLAT feature fusion
+    _needs_slat_fusion = any(
+        cfg.get("slat_fusion_mode", "primary") != "primary" for cfg in configs
+    )
+    if _needs_slat_fusion and pipeline_type != "512" and not args.sparse_only:
+        print(f"  extracting 1024-px conditioning for all {len(images)} views "
+              f"(needed for SLAT feature fusion) ...")
+        conds_1024 = [pipeline.get_cond([img], 1024) for img in images]
+    else:
+        conds_1024 = None
+
     print(f"  conditioning ready in {time.time() - t0:.1f}s")
 
     # --- Cache per-view logits, keyed by samples_per_view ---
@@ -338,11 +381,20 @@ def main() -> None:
     print_section(f"Sweeping {len(configs)} configs")
     results = []
 
+    # SLAT cache: maps coords_key → list of per-view SparseTensors
+    # Allows multiple SLAT fusion modes to reuse one shared sampling pass.
+    slat_cache: dict = {}
+
+    def _coords_key(c: "torch.Tensor") -> tuple:
+        """Fast approximate key for a coords tensor."""
+        return (tuple(c.shape), int(c.sum().item()))
+
     for cfg_idx, cfg in enumerate(configs):
-        label   = cfg["label"]
-        fusion  = cfg["fusion"]
-        spv     = cfg["samples_per_view"]
-        per_view_logits = logit_cache[spv]
+        label            = cfg["label"]
+        fusion           = cfg["fusion"]
+        spv              = cfg["samples_per_view"]
+        slat_mode        = cfg["slat_fusion_mode"]
+        per_view_logits  = logit_cache[spv]
 
         print(f"\n[{cfg_idx + 1}/{len(configs)}] {label}")
         t_fuse = time.time()
@@ -362,53 +414,103 @@ def main() -> None:
         print(f"  fused voxels: {n_voxels_fused:,}  ({elapsed_fuse:.2f}s)")
 
         result = {
-            "label":        label,
-            "fusion":       fusion,
-            "spv":          spv,
-            "voxels_fused": n_voxels_fused,
-            "elapsed_fuse": elapsed_fuse,
-            "glb_path":     None,
-            "voxels_slat":  None,
-            "elapsed_full": None,
+            "label":          label,
+            "fusion":         fusion,
+            "slat_mode":      slat_mode,
+            "spv":            spv,
+            "voxels_fused":   n_voxels_fused,
+            "elapsed_fuse":   elapsed_fuse,
+            "glb_path":       None,
+            "voxels_slat":    None,
+            "elapsed_full":   None,
         }
 
         if not args.sparse_only:
             t_full = time.time()
             torch.manual_seed(args.seed)
 
-            # Shape SLAT
+            use_slat_fusion = slat_mode != "primary" and len(images) > 1
+
+            # ---------- Shape SLAT ----------
             if pipeline_type == "512":
-                shape_slat = pipeline.sample_shape_slat(
-                    cond_512_primary,
-                    pipeline.models["shape_slat_flow_model_512"],
-                    coords, shape_params,
-                )
+                if use_slat_fusion:
+                    ck = _coords_key(coords)
+                    if ck not in slat_cache:
+                        print(f"  [slat-cache] sampling per-view SLAT (512) for coords {ck} ...")
+                        slat_cache[ck] = [
+                            pipeline.sample_shape_slat(
+                                c, pipeline.models["shape_slat_flow_model_512"],
+                                coords, shape_params,
+                            )
+                            for c in conds_512
+                        ]
+                    shape_slat = pipeline._fuse_slat_feats(slat_cache[ck], slat_mode)
+                    print(f"  [slat-fusion] {slat_mode} applied "
+                          f"({len(slat_cache[ck])} views, from cache)")
+                else:
+                    shape_slat = pipeline.sample_shape_slat(
+                        cond_512_primary,
+                        pipeline.models["shape_slat_flow_model_512"],
+                        coords, shape_params,
+                    )
                 tex_slat = pipeline.sample_tex_slat(
                     cond_512_primary,
                     pipeline.models["tex_slat_flow_model_512"],
                     shape_slat, tex_params,
                 )
                 res = 512
+
             elif pipeline_type == "1024":
-                shape_slat = pipeline.sample_shape_slat(
-                    cond_1024_primary,
-                    pipeline.models["shape_slat_flow_model_1024"],
-                    coords, shape_params,
-                )
+                _conds_hr = conds_1024 if conds_1024 else [cond_1024_primary]
+                if use_slat_fusion:
+                    ck = _coords_key(coords)
+                    if ck not in slat_cache:
+                        print(f"  [slat-cache] sampling per-view SLAT (1024) for coords {ck} ...")
+                        slat_cache[ck] = [
+                            pipeline.sample_shape_slat(
+                                c, pipeline.models["shape_slat_flow_model_1024"],
+                                coords, shape_params,
+                            )
+                            for c in _conds_hr
+                        ]
+                    shape_slat = pipeline._fuse_slat_feats(slat_cache[ck], slat_mode)
+                    print(f"  [slat-fusion] {slat_mode} applied "
+                          f"({len(slat_cache[ck])} views, from cache)")
+                else:
+                    shape_slat = pipeline.sample_shape_slat(
+                        cond_1024_primary,
+                        pipeline.models["shape_slat_flow_model_1024"],
+                        coords, shape_params,
+                    )
                 tex_slat = pipeline.sample_tex_slat(
                     cond_1024_primary,
                     pipeline.models["tex_slat_flow_model_1024"],
                     shape_slat, tex_params,
                 )
                 res = 1024
+
             elif pipeline_type in ("1024_cascade", "1536_cascade"):
-                shape_slat, res = pipeline.sample_shape_slat_cascade(
-                    cond_512_primary, cond_1024_primary,
-                    pipeline.models["shape_slat_flow_model_512"],
-                    pipeline.models["shape_slat_flow_model_1024"],
-                    512, 1024,
-                    coords, shape_params,
-                )
+                cascade_res = 1024 if pipeline_type == "1024_cascade" else 1536
+                _conds_hr = conds_1024 if conds_1024 else [cond_1024_primary]
+                if use_slat_fusion:
+                    shape_slat, res = pipeline.sample_shape_slat_cascade_multi(
+                        cond_512_primary, _conds_hr,
+                        pipeline.models["shape_slat_flow_model_512"],
+                        pipeline.models["shape_slat_flow_model_1024"],
+                        512, cascade_res,
+                        coords, shape_params, max_num_tokens=49152,
+                        slat_fusion_mode=slat_mode,
+                    )
+                    print(f"  [slat-fusion] cascade-multi {slat_mode} "
+                          f"({len(_conds_hr)} views)")
+                else:
+                    shape_slat, res = pipeline.sample_shape_slat_cascade(
+                        cond_512_primary, cond_1024_primary,
+                        pipeline.models["shape_slat_flow_model_512"],
+                        pipeline.models["shape_slat_flow_model_1024"],
+                        512, cascade_res,
+                        coords, shape_params,
+                    )
                 tex_slat = pipeline.sample_tex_slat(
                     cond_1024_primary,
                     pipeline.models["tex_slat_flow_model_1024"],
@@ -423,8 +525,8 @@ def main() -> None:
             elapsed_full = time.time() - t_full
             print(f"  SLAT+GLB done in {elapsed_full:.1f}s  →  {glb_path}")
 
-            result["glb_path"]    = glb_path
-            result["voxels_slat"] = int(shape_slat.coords.shape[0])
+            result["glb_path"]     = glb_path
+            result["voxels_slat"]  = int(shape_slat.coords.shape[0])
             result["elapsed_full"] = elapsed_full
 
             torch.cuda.empty_cache()
@@ -433,7 +535,8 @@ def main() -> None:
 
     # --- Summary table ---
     print_section("Sweep summary")
-    col_w = max(len(r["label"]) for r in results) + 2
+    col_w      = max(len(r["label"])     for r in results) + 2
+    slat_col_w = max(len(r["slat_mode"]) for r in results) + 2
 
     if args.sparse_only:
         header = f"{'Config':<{col_w}} {'Vox(fused)':>12}  {'t_fuse':>8}"
@@ -446,7 +549,8 @@ def main() -> None:
             )
     else:
         header = (
-            f"{'Config':<{col_w}} {'Vox(fused)':>12} {'Vox(SLAT)':>12} "
+            f"{'Config':<{col_w}} {'SLAT-fusion':<{slat_col_w}} "
+            f"{'Vox(fused)':>12} {'Vox(SLAT)':>12} "
             f"{'t_fuse':>8} {'t_full':>8}  GLB"
         )
         print(header)
@@ -456,7 +560,8 @@ def main() -> None:
             full_str = f"{r['elapsed_full']:>7.1f}s" if r["elapsed_full"] is not None else f"{'—':>8}"
             glb_name = os.path.basename(r["glb_path"]) if r["glb_path"] else "—"
             print(
-                f"{r['label']:<{col_w}} {r['voxels_fused']:>12,} {slat_str} "
+                f"{r['label']:<{col_w}} {r['slat_mode']:<{slat_col_w}} "
+                f"{r['voxels_fused']:>12,} {slat_str} "
                 f"{r['elapsed_fuse']:>7.2f}s {full_str}  {glb_name}"
             )
     print()

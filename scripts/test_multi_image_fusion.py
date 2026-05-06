@@ -1,35 +1,36 @@
 """
-Test script for multi-image sparse occupancy fusion.
+Test script for multi-image sparse occupancy fusion and SLAT feature fusion.
 
 Usage examples
 --------------
 # Single image (baseline)
 python scripts/test_multi_image_fusion.py front.png --output-dir ./out
 
-# Multi-image union fusion
+# Multi-image union fusion (sparse only)
 python scripts/test_multi_image_fusion.py front.png side.png rear.png \\
     --fusion union --output-dir ./out
-
-# Multi-image majority vote
-python scripts/test_multi_image_fusion.py front.png side.png rear.png \\
-    --fusion vote --vote-threshold 0.5 --output-dir ./out
 
 # Logit-mean fusion (fuse raw decoder scores, single threshold at 0.0)
 python scripts/test_multi_image_fusion.py front.png side.png rear.png \\
     --fusion logit-mean --output-dir ./out
 
-# Logit-max fusion with spatial smoothing
+# Logit-mean sparse + SLAT feature fusion (operates at latent geometry level)
 python scripts/test_multi_image_fusion.py front.png side.png rear.png \\
-    --fusion logit-max --logit-smooth-sigma 0.8 --output-dir ./out
+    --fusion logit-mean --slat-fusion slat-mean --output-dir ./out
 
-# Logit-mean + ensemble ×3 (most evidence, 3× sparse-stage compute)
+# Norm-weighted SLAT fusion (weights views by feature confidence per token)
 python scripts/test_multi_image_fusion.py front.png side.png rear.png \\
-    --fusion logit-mean --samples-per-view 3 --output-dir ./out
+    --fusion logit-mean --slat-fusion slat-norm-weighted --output-dir ./out
+
+# Full combo: logit-mean sparse + smoothing + slat-mean
+python scripts/test_multi_image_fusion.py front.png side.png rear.png \\
+    --fusion logit-mean --logit-smooth-sigma 0.8 --slat-fusion slat-mean \\
+    --output-dir ./out
 
 # Side-by-side comparison: runs single-image baseline AND multi-image fusion,
 # saves both GLBs, prints voxel count statistics.
 python scripts/test_multi_image_fusion.py front.png side.png rear.png \\
-    --compare --fusion logit-mean --output-dir ./out
+    --compare --fusion logit-mean --slat-fusion slat-mean --output-dir ./out
 
 # Use a lower-resolution pipeline to speed up testing
 python scripts/test_multi_image_fusion.py front.png side.png \\
@@ -159,6 +160,23 @@ def parse_args() -> argparse.Namespace:
             "fused logit volume before thresholding in logit-* modes.  "
             "Reinforces weak-evidence voxels surrounded by stronger neighbours.  "
             "0.0 = disabled (default).  0.5–1.5 is a good starting range."
+        ),
+    )
+    parser.add_argument(
+        "--slat-fusion",
+        choices=["primary", "slat-mean", "slat-norm-weighted", "slat-max"],
+        default="primary",
+        metavar="MODE",
+        help=(
+            "Shape SLAT feature fusion mode (default: primary).  "
+            "'primary' = only the first image conditions the SLAT flow model.  "
+            "'slat-mean' = run SLAT diffusion once per view, average the "
+            "32-ch feature vectors — operates at the actual geometry "
+            "representation level rather than the occupancy voxel level.  "
+            "'slat-norm-weighted' = weight by per-token feature norm magnitude.  "
+            "'slat-max' = element-wise maximum across views.  "
+            "For cascade pipelines the LR stage always uses the primary view; "
+            "only the HR stage is run per-view."
         ),
     )
     parser.add_argument(
@@ -337,6 +355,8 @@ def main() -> None:
             extras.append(f"×{args.samples_per_view}/view")
         if args.filter_min_neighbors > 0:
             extras.append(f"filter≥{args.filter_min_neighbors}nb")
+        if args.slat_fusion != "primary":
+            extras.append(f"SLAT={args.slat_fusion}")
         label_extras = (", " + ", ".join(extras)) if extras else ""
         print_section(
             f"Multi-image fusion  [{args.fusion}{label_extras}]  ({len(images)} images)"
@@ -352,6 +372,7 @@ def main() -> None:
             logit_smooth_sigma=args.logit_smooth_sigma,
             samples_per_view=args.samples_per_view,
             filter_min_neighbors=args.filter_min_neighbors,
+            slat_fusion_mode=args.slat_fusion,
             preprocess_image=preprocess,
             sparse_structure_sampler_params=ss_params,
             shape_slat_sampler_params=shape_params,
@@ -372,6 +393,8 @@ def main() -> None:
             file_label_parts.append(f"spv{args.samples_per_view}")
         if args.filter_min_neighbors > 0:
             file_label_parts.append(f"fn{args.filter_min_neighbors}")
+        if args.slat_fusion != "primary":
+            file_label_parts.append(args.slat_fusion.replace("-", "_"))
         glb_path = save_glb(
             pipeline, out_multi[0], res_m, args.output_dir,
             "_".join(file_label_parts), args.texture_size, args.decimation

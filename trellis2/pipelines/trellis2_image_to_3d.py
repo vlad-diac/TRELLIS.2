@@ -273,7 +273,181 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         slat = slat * std + mean
         
         return slat
-    
+
+    @staticmethod
+    def _fuse_slat_feats(slats: list, mode: str) -> "SparseTensor":
+        """
+        Fuse a list of per-view SparseTensors (sharing identical coords) by
+        combining their feature vectors with the requested strategy.
+
+        Args:
+            slats (list[SparseTensor]): Per-view SLAT tensors, all with the
+                same coords layout.
+            mode (str): One of ``"slat-mean"``, ``"slat-norm-weighted"``,
+                ``"slat-max"``.
+
+        Returns:
+            SparseTensor: Single tensor with the same coords as ``slats[0]``
+                and fused feature vectors.
+        """
+        stacked = torch.stack([s.feats for s in slats], dim=0)  # (V, T, C)
+
+        if mode == "slat-mean":
+            fused = stacked.mean(dim=0)
+        elif mode == "slat-norm-weighted":
+            # Weight each view's contribution by softmax(||feat||_2) per token.
+            # Views that generate high-magnitude features at a coordinate are
+            # more "confident" about the geometry there.
+            norms = stacked.norm(dim=-1, keepdim=True)      # (V, T, 1)
+            weights = torch.softmax(norms, dim=0)           # (V, T, 1)
+            fused = (stacked * weights).sum(dim=0)          # (T, C)
+        elif mode == "slat-max":
+            fused = stacked.max(dim=0).values               # (T, C)
+        else:
+            raise ValueError(
+                f"Unknown slat_fusion_mode: {mode!r}. "
+                f"Choose 'slat-mean', 'slat-norm-weighted', or 'slat-max'."
+            )
+
+        return slats[0].replace(fused)
+
+    def sample_shape_slat_multi(
+        self,
+        conds_per_view: List[dict],
+        flow_model,
+        coords: torch.Tensor,
+        sampler_params: dict = {},
+        slat_fusion_mode: str = "slat-mean",
+    ) -> "SparseTensor":
+        """
+        Run the shape SLAT flow model once per view using a shared coordinate
+        set, then fuse the resulting feature vectors.
+
+        Each view generates a full 32-channel feature tensor at every active
+        sparse coordinate.  Fusing these tensors combines geometric evidence
+        from all viewpoints before decoding, operating at the true geometry
+        representation level rather than the occupancy voxel level.
+
+        Args:
+            conds_per_view (List[dict]): Per-view conditioning dicts from
+                ``get_cond()``.  All views share the same ``coords`` so the
+                resulting SparseTensors have identical coordinate layouts.
+            flow_model: The shape SLAT flow model to use.
+            coords (torch.Tensor): Sparse coordinate tensor of shape (T, 4)
+                [batch_idx, x, y, z] — shared across all views.
+            sampler_params (dict): Extra sampler kwargs (merged with
+                ``self.shape_slat_sampler_params`` inside
+                ``sample_shape_slat``).
+            slat_fusion_mode (str):
+                ``"slat-mean"``          — average features across views.
+                ``"slat-norm-weighted"`` — weight by per-token feature norm.
+                ``"slat-max"``           — element-wise maximum across views.
+
+        Returns:
+            SparseTensor: Fused shape SLAT with the same coords as input.
+        """
+        per_view_slats = []
+        for view_idx, cond in enumerate(conds_per_view):
+            print(f"[slat-fusion] sampling shape SLAT view "
+                  f"{view_idx + 1}/{len(conds_per_view)} ({slat_fusion_mode}) ...")
+            slat = self.sample_shape_slat(cond, flow_model, coords, sampler_params)
+            per_view_slats.append(slat)
+
+        fused = self._fuse_slat_feats(per_view_slats, slat_fusion_mode)
+        print(f"[slat-fusion] fused {len(conds_per_view)} SLAT views "
+              f"→ {fused.feats.shape[0]:,} tokens × {fused.feats.shape[1]}ch")
+        return fused
+
+    def sample_shape_slat_cascade_multi(
+        self,
+        lr_cond: dict,
+        conds_per_view: List[dict],
+        flow_model_lr,
+        flow_model,
+        lr_resolution: int,
+        resolution: int,
+        coords: torch.Tensor,
+        sampler_params: dict = {},
+        max_num_tokens: int = 49152,
+        slat_fusion_mode: str = "slat-mean",
+    ) -> tuple:
+        """
+        Cascade SLAT sampling with per-view HR-stage fusion.
+
+        The LR stage uses ``lr_cond`` (primary view) to produce a coarse SLAT
+        which is upsampled to generate HR coordinates.  The HR stage is then
+        run once per view in ``conds_per_view`` and the resulting feature
+        vectors are fused before returning.
+
+        Args:
+            lr_cond (dict): Conditioning dict for the LR flow stage (primary
+                view, 512-px).
+            conds_per_view (List[dict]): Per-view conditioning dicts for the
+                HR flow stage (one per view, 1024-px).
+            flow_model_lr: LR shape SLAT flow model.
+            flow_model: HR shape SLAT flow model.
+            lr_resolution (int): LR coordinate grid size (typically 512).
+            resolution (int): Target HR resolution (1024 or 1536).
+            coords (torch.Tensor): Coarse-stage sparse coords (T, 4).
+            sampler_params (dict): Extra sampler kwargs.
+            max_num_tokens (int): Token budget cap for HR coords.
+            slat_fusion_mode (str): Feature fusion mode for the HR stage.
+
+        Returns:
+            Tuple[SparseTensor, int]: Fused HR SLAT and effective resolution.
+        """
+        # --- LR stage: primary view only (unchanged from existing cascade) ---
+        noise = SparseTensor(
+            feats=torch.randn(coords.shape[0], flow_model_lr.in_channels).to(self.device),
+            coords=coords,
+        )
+        merged_params = {**self.shape_slat_sampler_params, **sampler_params}
+        if self.low_vram:
+            flow_model_lr.to(self.device)
+        slat_lr = self.shape_slat_sampler.sample(
+            flow_model_lr,
+            noise,
+            **lr_cond,
+            **merged_params,
+            verbose=True,
+            tqdm_desc="Sampling shape SLat (LR, primary)",
+        ).samples
+        if self.low_vram:
+            flow_model_lr.cpu()
+        std = torch.tensor(self.shape_slat_normalization['std'])[None].to(slat_lr.device)
+        mean = torch.tensor(self.shape_slat_normalization['mean'])[None].to(slat_lr.device)
+        slat_lr = slat_lr * std + mean
+
+        # --- Upsample LR SLAT to get HR coordinate proposals ---
+        if self.low_vram:
+            self.models['shape_slat_decoder'].to(self.device)
+            self.models['shape_slat_decoder'].low_vram = True
+        hr_coords = self.models['shape_slat_decoder'].upsample(slat_lr, upsample_times=4)
+        if self.low_vram:
+            self.models['shape_slat_decoder'].cpu()
+            self.models['shape_slat_decoder'].low_vram = False
+
+        hr_resolution = resolution
+        while True:
+            quant_coords = torch.cat([
+                hr_coords[:, :1],
+                ((hr_coords[:, 1:] + 0.5) / lr_resolution * (hr_resolution // 16)).int(),
+            ], dim=1)
+            coords = quant_coords.unique(dim=0)
+            num_tokens = coords.shape[0]
+            if num_tokens < max_num_tokens or hr_resolution == 1024:
+                if hr_resolution != resolution:
+                    print(f"Due to the limited number of tokens, the resolution "
+                          f"is reduced to {hr_resolution}.")
+                break
+            hr_resolution -= 128
+
+        # --- HR stage: run per-view, fuse feature vectors ---
+        shape_slat = self.sample_shape_slat_multi(
+            conds_per_view, flow_model, coords, sampler_params, slat_fusion_mode,
+        )
+        return shape_slat, hr_resolution
+
     def sample_shape_slat_cascade(
         self,
         lr_cond: dict,
@@ -646,6 +820,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         logit_smooth_sigma: float = 0.0,
         samples_per_view: int = 1,
         filter_min_neighbors: int = 0,
+        slat_fusion_mode: str = "primary",
         sparse_structure_sampler_params: dict = {},
         shape_slat_sampler_params: dict = {},
         tex_slat_sampler_params: dict = {},
@@ -656,16 +831,19 @@ class Trellis2ImageTo3DPipeline(Pipeline):
     ) -> List[MeshWithVoxel]:
         """
         Run the pipeline with multiple input images fused at the sparse
-        occupancy stage (Strategy B).
+        occupancy stage and optionally also at the shape SLAT feature stage.
 
         The sparse structure flow model is run once per image and the
         resulting occupancy volumes are fused before Shape SLAT generation.
-        Everything downstream is identical to ``run()``.
+        When ``slat_fusion_mode`` is not ``"primary"``, the shape SLAT flow
+        model is also run once per image and the resulting 32-channel feature
+        vectors are fused before decoding — operating at the true geometry
+        representation level.
 
         Args:
             images (List[Image.Image]): Input images from different viewpoints.
                 The first image is used as the primary conditioning image for
-                Shape and Texture SLAT generation.
+                Texture SLAT generation.
             num_samples (int): Number of samples (per view, typically 1).
             seed (int): Random seed.
             fusion_mode (str): ``"union"``, ``"vote"``, ``"logit-mean"``,
@@ -679,6 +857,15 @@ class Trellis2ImageTo3DPipeline(Pipeline):
                 each view before cross-view fusion (1 = disabled).
             filter_min_neighbors (int): Post-fusion neighbourhood filter;
                 0 = disabled.
+            slat_fusion_mode (str): Shape SLAT feature fusion strategy.
+                ``"primary"``          — only the first image conditions the
+                                         SLAT flow model (current default).
+                ``"slat-mean"``        — run SLAT flow once per view, average
+                                         the 32-ch feature vectors.
+                ``"slat-norm-weighted"`` — weight by per-token feature norm.
+                ``"slat-max"``         — element-wise max across views.
+                For cascade pipelines the LR stage always uses the primary
+                view; only the HR stage is run per-view.
             sparse_structure_sampler_params (dict): Forwarded to each per-view
                 sparse structure sample step.
             shape_slat_sampler_params (dict): Forwarded to shape SLAT sampling.
@@ -716,13 +903,23 @@ class Trellis2ImageTo3DPipeline(Pipeline):
 
         torch.manual_seed(seed)
 
+        _multi_slat = slat_fusion_mode != "primary" and len(images) > 1
+
         # --- per-view conditioning at 512 px (used for occupancy fusion) ---
         print(f"[run_multi_image] extracting conditioning for {len(images)} image(s) ...")
         conds_512 = [self.get_cond([img], 512) for img in images]
 
-        # --- primary conditioning for SLAT (first / only image) ---
+        # --- primary conditioning for SLAT (always needed) ---
         cond_512_primary = conds_512[0]
         cond_1024_primary = self.get_cond([images[0]], 1024) if pipeline_type != '512' else None
+
+        # --- per-view 1024-px conditioning (only needed for SLAT feature fusion) ---
+        if _multi_slat and pipeline_type not in ('512',):
+            print(f"[run_multi_image] extracting 1024-px conditioning for all "
+                  f"{len(images)} views (slat_fusion_mode={slat_fusion_mode!r}) ...")
+            conds_1024 = [self.get_cond([img], 1024) for img in images]
+        else:
+            conds_1024 = None
 
         ss_res = {'512': 32, '1024': 64, '1024_cascade': 32, '1536_cascade': 32}[pipeline_type]
 
@@ -744,45 +941,77 @@ class Trellis2ImageTo3DPipeline(Pipeline):
                 filter_min_neighbors=filter_min_neighbors,
             )
 
-        # --- rest of pipeline identical to run() ---
+        # --- shape SLAT (primary-only or per-view feature fusion) ---
         if pipeline_type == '512':
-            shape_slat = self.sample_shape_slat(
-                cond_512_primary, self.models['shape_slat_flow_model_512'],
-                coords, shape_slat_sampler_params,
-            )
+            if _multi_slat:
+                shape_slat = self.sample_shape_slat_multi(
+                    conds_512, self.models['shape_slat_flow_model_512'],
+                    coords, shape_slat_sampler_params, slat_fusion_mode,
+                )
+            else:
+                shape_slat = self.sample_shape_slat(
+                    cond_512_primary, self.models['shape_slat_flow_model_512'],
+                    coords, shape_slat_sampler_params,
+                )
             tex_slat = self.sample_tex_slat(
                 cond_512_primary, self.models['tex_slat_flow_model_512'],
                 shape_slat, tex_slat_sampler_params,
             )
             res = 512
         elif pipeline_type == '1024':
-            shape_slat = self.sample_shape_slat(
-                cond_1024_primary, self.models['shape_slat_flow_model_1024'],
-                coords, shape_slat_sampler_params,
-            )
+            if _multi_slat:
+                shape_slat = self.sample_shape_slat_multi(
+                    conds_1024, self.models['shape_slat_flow_model_1024'],
+                    coords, shape_slat_sampler_params, slat_fusion_mode,
+                )
+            else:
+                shape_slat = self.sample_shape_slat(
+                    cond_1024_primary, self.models['shape_slat_flow_model_1024'],
+                    coords, shape_slat_sampler_params,
+                )
             tex_slat = self.sample_tex_slat(
                 cond_1024_primary, self.models['tex_slat_flow_model_1024'],
                 shape_slat, tex_slat_sampler_params,
             )
             res = 1024
         elif pipeline_type == '1024_cascade':
-            shape_slat, res = self.sample_shape_slat_cascade(
-                cond_512_primary, cond_1024_primary,
-                self.models['shape_slat_flow_model_512'], self.models['shape_slat_flow_model_1024'],
-                512, 1024,
-                coords, shape_slat_sampler_params, max_num_tokens,
-            )
+            if _multi_slat:
+                shape_slat, res = self.sample_shape_slat_cascade_multi(
+                    cond_512_primary, conds_1024,
+                    self.models['shape_slat_flow_model_512'],
+                    self.models['shape_slat_flow_model_1024'],
+                    512, 1024,
+                    coords, shape_slat_sampler_params, max_num_tokens, slat_fusion_mode,
+                )
+            else:
+                shape_slat, res = self.sample_shape_slat_cascade(
+                    cond_512_primary, cond_1024_primary,
+                    self.models['shape_slat_flow_model_512'],
+                    self.models['shape_slat_flow_model_1024'],
+                    512, 1024,
+                    coords, shape_slat_sampler_params, max_num_tokens,
+                )
             tex_slat = self.sample_tex_slat(
                 cond_1024_primary, self.models['tex_slat_flow_model_1024'],
                 shape_slat, tex_slat_sampler_params,
             )
         elif pipeline_type == '1536_cascade':
-            shape_slat, res = self.sample_shape_slat_cascade(
-                cond_512_primary, cond_1024_primary,
-                self.models['shape_slat_flow_model_512'], self.models['shape_slat_flow_model_1024'],
-                512, 1536,
-                coords, shape_slat_sampler_params, max_num_tokens,
-            )
+            if _multi_slat:
+                shape_slat, res = self.sample_shape_slat_cascade_multi(
+                    cond_512_primary, conds_1024,
+                    self.models['shape_slat_flow_model_512'],
+                    self.models['shape_slat_flow_model_1024'],
+                    512, 1536,
+                    coords, shape_slat_sampler_params, max_num_tokens, slat_fusion_mode,
+                )
+            else:
+                shape_slat, res = self.sample_shape_slat_cascade(
+                    cond_512_primary, cond_1024_primary,
+                    self.models['shape_slat_flow_model_512'],
+                    self.models['shape_slat_flow_model_1024'],
+                    512, 1536,
+                    coords, shape_slat_sampler_params, max_num_tokens,
+                )
             tex_slat = self.sample_tex_slat(
                 cond_1024_primary, self.models['tex_slat_flow_model_1024'],
                 shape_slat, tex_slat_sampler_params,
