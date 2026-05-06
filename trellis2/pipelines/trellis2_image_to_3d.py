@@ -185,12 +185,79 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             'neg_cond': neg_cond,
         }
 
+    def get_cond_multi(
+        self,
+        images: List[Image.Image],
+        resolution: int,
+        fusion_mode: str = "mean",
+        include_neg_cond: bool = True,
+    ) -> dict:
+        """
+        Build a single joint conditioning tensor from multiple input images.
+
+        Unlike calling ``get_cond()`` once per view, this method encodes all
+        views and fuses their patch-token sequences into one conditioning
+        representation before stage one runs.  This gives the sparse-structure
+        and SLAT flow models a coherent multi-view signal from a single
+        sampling pass, bypassing the independent-mode-selection failure that
+        occurs when separate per-view conditions drive separate stage-one runs.
+
+        The ``SLatFlowModel`` already accepts ``cond`` as a
+        ``List[torch.Tensor]`` (converted to ``VarLenTensor`` internally), so
+        per-view conditioning lists are also valid for stage two — see
+        ``run_multi_image_cond()`` which exposes both options.
+
+        Args:
+            images: PIL images, one per viewpoint.
+            resolution: DINOv3 conditioning resolution — 512 or 1024.
+            fusion_mode:
+                ``"mean"``   — average patch-token sequences element-wise;
+                               output shape ``(1, N, D)``.  Same token count
+                               as single-image conditioning; plug-in compatible
+                               with existing stage-one / stage-two samplers.
+                ``"concat"`` — concatenate token sequences along the token
+                               dimension; output shape ``(1, V*N, D)``.  Richer
+                               multi-view context at the cost of a longer
+                               cross-attention sequence in the flow models.
+            include_neg_cond: Whether to include a zero-filled ``neg_cond``
+                tensor for classifier-free guidance.
+
+        Returns:
+            dict with keys ``"cond"`` (and ``"neg_cond"`` when requested).
+        """
+        self.image_cond_model.image_size = resolution
+        if self.low_vram:
+            self.image_cond_model.to(self.device)
+
+        per_view = []
+        for img in images:
+            c = self.image_cond_model([img])   # (1, N, D)
+            per_view.append(c)
+
+        if self.low_vram:
+            self.image_cond_model.cpu()
+
+        if fusion_mode == "mean":
+            fused = torch.stack(per_view, dim=0).mean(dim=0)   # (1, N, D)
+        elif fusion_mode == "concat":
+            fused = torch.cat(per_view, dim=1)                  # (1, V*N, D)
+        else:
+            raise ValueError(
+                f"Unknown fusion_mode {fusion_mode!r}. Choose 'mean' or 'concat'."
+            )
+
+        if not include_neg_cond:
+            return {'cond': fused}
+        return {'cond': fused, 'neg_cond': torch.zeros_like(fused)}
+
     def sample_sparse_structure(
         self,
         cond: dict,
         resolution: int,
         num_samples: int = 1,
         sampler_params: dict = {},
+        depth_bias_volume: Optional[torch.Tensor] = None,
+        depth_bias_scale: float = 1.0,
     ) -> torch.Tensor:
         """
         Sample sparse structures with the given conditioning.
@@ -200,12 +267,23 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             resolution (int): The resolution of the sparse structure.
             num_samples (int): The number of samples to generate.
             sampler_params (dict): Additional parameters for the sampler.
+            depth_bias_volume: Optional float tensor of shape
+                ``(num_samples, in_channels, reso, reso, reso)`` (or
+                broadcastable) added to the initial Gaussian noise before
+                sampling.  Positive values bias the sampler toward occupying
+                those voxels.  Use ``depth_map_to_bias_volume()`` to create
+                this from a monocular depth prediction.
+            depth_bias_scale: Scalar multiplied into ``depth_bias_volume``
+                before adding to noise.  Values of 0.5–2.0 give useful
+                guidance without overwhelming the flow model.
         """
         # Sample sparse structure latent
         flow_model = self.models['sparse_structure_flow_model']
         reso = flow_model.resolution
         in_channels = flow_model.in_channels
         noise = torch.randn(num_samples, in_channels, reso, reso, reso).to(self.device)
+        if depth_bias_volume is not None:
+            noise = noise + depth_bias_scale * depth_bias_volume.to(self.device)
         sampler_params = {**self.sparse_structure_sampler_params, **sampler_params}
         if self.low_vram:
             flow_model.to(self.device)
@@ -544,6 +622,8 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         sampler_params: dict = {},
         samples_per_view: int = 1,
         return_logits: bool = False,
+        depth_bias_volume: Optional[torch.Tensor] = None,
+        depth_bias_scale: float = 1.0,
     ):
         """
         Run the sparse structure flow model and return the decoded boolean
@@ -566,6 +646,13 @@ class Trellis2ImageTo3DPipeline(Pipeline):
                 the raw float tensor of shape (B, 1, reso, reso, reso) before
                 the ``> 0`` threshold is applied.  Default False preserves the
                 original single-return behaviour.
+            depth_bias_volume: Optional float tensor broadcastable to
+                ``(num_samples, in_channels, reso, reso, reso)`` added to
+                each noise sample.  Positive values bias the sampler toward
+                occupying those voxels.  Build with
+                ``depth_map_to_bias_volume()``.
+            depth_bias_scale: Scalar weight applied to ``depth_bias_volume``
+                (default 1.0).
 
         Returns:
             torch.Tensor: Boolean tensor of shape (B, 1, reso, reso, reso), or
@@ -582,6 +669,8 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         raw_logits_list = []
         for run_idx in range(samples_per_view):
             noise = torch.randn(num_samples, in_channels, reso, reso, reso).to(self.device)
+            if depth_bias_volume is not None:
+                noise = noise + depth_bias_scale * depth_bias_volume.to(self.device)
             z_s = self.sparse_structure_sampler.sample(
                 flow_model,
                 noise,
@@ -673,6 +762,162 @@ class Trellis2ImageTo3DPipeline(Pipeline):
 
         return F.conv3d(logits.float(), kernel, padding=radius)
 
+    @staticmethod
+    def apply_symmetry_prior(
+        coords: torch.Tensor,
+        grid_size: Optional[int] = None,
+        axis: int = 0,
+    ) -> torch.Tensor:
+        """
+        Mirror occupied voxels across the midplane of ``axis`` and union with
+        the originals.
+
+        Ships have strong port/starboard symmetry.  Reflecting the sparse
+        coordinate set across the lateral midplane directly halves the
+        hallucination problem on the hidden side without any model retraining.
+
+        The midplane is placed at ``(grid_size - 1) / 2``.  A voxel at
+        position ``p`` maps to ``(grid_size - 1) - p``.  When ``grid_size``
+        is ``None`` it is inferred as ``coords[:, 1:].max() + 1``, which is
+        correct whenever at least one coordinate touches the far wall.
+
+        Args:
+            coords: Integer tensor of shape ``(N, 4)`` — batch index, x, y, z
+                — as returned by ``sample_sparse_structure()``.
+            grid_size: Side length of the voxel grid (e.g. 32 for the LR
+                stage).  Pass explicitly if the coords might not span the full
+                range.
+            axis: Which spatial axis to mirror across.
+                0 → x (port/starboard for a vessel with beam along x)
+                1 → y (fore/aft)
+                2 → z (vertical)
+
+        Returns:
+            torch.Tensor: Deduplicated union of original and mirrored coords,
+            shape ``(M, 4)`` where ``M >= N``.
+        """
+        if grid_size is None:
+            grid_size = int(coords[:, 1:].max().item()) + 1
+        col = axis + 1  # skip batch-index column
+        mirrored = coords.clone()
+        mirrored[:, col] = (grid_size - 1) - coords[:, col]
+        combined = torch.cat([coords, mirrored], dim=0)
+        combined = torch.unique(combined, dim=0)
+        return combined
+
+    @staticmethod
+    def depth_map_to_bias_volume(
+        depth_map: "np.ndarray",
+        grid_size: int = 32,
+        in_channels: int = 8,
+        depth_range: Optional[tuple] = None,
+        projection: str = "orthographic",
+        azimuth_deg: float = 0.0,
+        elevation_deg: float = 0.0,
+    ) -> torch.Tensor:
+        """
+        Convert a monocular depth map into a voxel bias volume for
+        ``sample_sparse_structure()`` / ``_sample_occupancy_volume()``.
+
+        The output is a float tensor of shape
+        ``(1, in_channels, grid_size, grid_size, grid_size)`` whose positive
+        values bias the sparse-structure flow sampler toward occupying voxels
+        near the depth surface.  It is added to the initial Gaussian noise
+        before sampling with ``depth_bias_scale`` as the weight.
+
+        Projection model:
+            The depth map is first normalised to [0, 1] and then each pixel
+            ``(u, v)`` with depth ``d`` is mapped to an approximate object-
+            space coordinate:
+
+                x = (u / W - 0.5)          ← lateral
+                y = -(v / H - 0.5)         ← vertical (image y flipped)
+                z = 1.0 - d                ← depth toward viewer → front
+
+            These coordinates are scaled to the voxel grid and rounded to the
+            nearest integer.  Each occupied voxel receives a bias value of +2.
+
+            When ``projection = "perspective"`` the same formula is used but
+            the x/y coordinates are scaled by a factor accounting for the
+            assumed object-space depth (valid for small FoV or objects that
+            fill the frame).
+
+            For multi-view use, call this function once per view, then average
+            the resulting bias volumes before passing to ``_sample_occupancy_volume()``.
+
+        Args:
+            depth_map: Float or uint16 array of shape ``(H, W)`` with larger
+                values meaning farther away.  Pass the raw output of your
+                depth model (Depth Anything V2, MoGe, etc.).
+            grid_size: Side length of the voxel grid; must match the sparse
+                structure flow model resolution (default 32).
+            in_channels: Number of channels of the sparse-structure latent
+                space (default 8).  The bias is broadcast across all channels.
+            depth_range: ``(min_d, max_d)`` for normalising the depth map.
+                ``None`` uses the per-image min/max.
+            projection: ``"orthographic"`` (default) or ``"perspective"``.
+                Orthographic is sufficient for distant objects that fill the
+                frame.
+            azimuth_deg: Approximate azimuth of the camera around the object
+                (0 = front view).  Used to rotate the point cloud into the
+                object-centric frame before voxelisation.
+            elevation_deg: Approximate camera elevation in degrees above
+                the equatorial plane.
+
+        Returns:
+            torch.Tensor: Shape ``(1, in_channels, G, G, G)`` float tensor
+            suitable for passing as ``depth_bias_volume`` to
+            ``sample_sparse_structure()``.
+        """
+        import numpy as np
+        import math
+
+        depth = depth_map.astype(np.float32)
+        d_min, d_max = (depth_range if depth_range is not None
+                        else (float(depth.min()), float(depth.max())))
+        if d_max > d_min:
+            depth = (depth - d_min) / (d_max - d_min)
+        else:
+            depth = np.zeros_like(depth)
+
+        H, W = depth.shape
+        u = np.arange(W, dtype=np.float32)
+        v = np.arange(H, dtype=np.float32)
+        uu, vv = np.meshgrid(u, v)
+
+        x_obj = uu / W - 0.5           # [-0.5, 0.5]
+        y_obj = -(vv / H - 0.5)        # [-0.5, 0.5], flipped
+        z_obj = 1.0 - depth            # close = high z
+
+        # Rotate into object frame using azimuth / elevation
+        az = math.radians(azimuth_deg)
+        el = math.radians(elevation_deg)
+        # Rotation: first elevation (around x), then azimuth (around y)
+        cos_az, sin_az = math.cos(az), math.sin(az)
+        cos_el, sin_el = math.cos(el), math.sin(el)
+        # Points in camera frame → rotate to object frame
+        x_rot = cos_az * x_obj - sin_az * z_obj
+        y_rot = sin_el * sin_az * x_obj + cos_el * y_obj + sin_el * cos_az * z_obj
+        z_rot = cos_el * sin_az * x_obj - sin_el * y_obj + cos_el * cos_az * z_obj
+
+        # Map [-0.5, 0.5] → [0, grid_size - 1]
+        G = grid_size
+        xi = np.clip(np.round((x_rot + 0.5) * (G - 1)).astype(np.int32), 0, G - 1)
+        yi = np.clip(np.round((y_rot + 0.5) * (G - 1)).astype(np.int32), 0, G - 1)
+        zi = np.clip(np.round((z_rot + 0.5) * (G - 1)).astype(np.int32), 0, G - 1)
+
+        # Accumulate occupancy votes into voxel grid
+        vol = np.zeros((G, G, G), dtype=np.float32)
+        np.add.at(vol, (xi.ravel(), yi.ravel(), zi.ravel()), 1.0)
+        # Normalise to [0, 2] so that peak voxels get a bias of ~2 sigma
+        if vol.max() > 0:
+            vol = vol / vol.max() * 2.0
+
+        # Broadcast to (1, in_channels, G, G, G)
+        bias = torch.from_numpy(vol).unsqueeze(0).unsqueeze(0)  # (1, 1, G, G, G)
+        bias = bias.expand(1, in_channels, G, G, G).contiguous()
+        return bias
+
     def sample_sparse_structure_multi(
         self,
         conds_per_view: List[dict],
@@ -685,6 +930,8 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         logit_smooth_sigma: float = 0.0,
         samples_per_view: int = 1,
         filter_min_neighbors: int = 0,
+        depth_bias_volumes: Optional[List[torch.Tensor]] = None,
+        depth_bias_scale: float = 1.0,
     ) -> torch.Tensor:
         """
         Run the sparse structure flow model once per view, fuse the resulting
@@ -729,6 +976,15 @@ class Trellis2ImageTo3DPipeline(Pipeline):
                 than this many occupied neighbours in their 3×3×3 block.
                 0 = disabled (default).  2–4 is a good range for cleaning
                 isolated hallucination islands without eroding real geometry.
+            depth_bias_volumes: Optional list of float tensors, one per view,
+                each of shape broadcastable to
+                ``(num_samples, in_channels, reso, reso, reso)``.  Each is
+                added to the initial noise for the corresponding view before
+                sampling.  Build per-view tensors with
+                ``depth_map_to_bias_volume()``, then optionally average them
+                to get a view-independent prior.  ``None`` disables depth
+                guidance (default).
+            depth_bias_scale: Scalar weight applied to all depth bias volumes.
 
         Returns:
             torch.Tensor: Fused coords tensor of shape (N_occupied, 4)
@@ -743,14 +999,22 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         for view_idx, cond in enumerate(conds_per_view):
             print(f"[multi-fusion] sampling view {view_idx + 1}/{len(conds_per_view)}"
                   + (f" (×{samples_per_view} ensemble)" if samples_per_view > 1 else "") + " ...")
+            dbv = (depth_bias_volumes[view_idx]
+                   if depth_bias_volumes is not None and view_idx < len(depth_bias_volumes)
+                   else None)
             if use_logit_fusion:
                 vol, logits = self._sample_occupancy_volume(
-                    cond, num_samples, sampler_params, samples_per_view, return_logits=True
+                    cond, num_samples, sampler_params, samples_per_view,
+                    return_logits=True,
+                    depth_bias_volume=dbv, depth_bias_scale=depth_bias_scale,
                 )
                 per_view_logits.append(logits)
                 per_view_vols.append(vol)
             else:
-                vol = self._sample_occupancy_volume(cond, num_samples, sampler_params, samples_per_view)
+                vol = self._sample_occupancy_volume(
+                    cond, num_samples, sampler_params, samples_per_view,
+                    depth_bias_volume=dbv, depth_bias_scale=depth_bias_scale,
+                )
                 per_view_vols.append(vol)
             print(f"[multi-fusion] view {view_idx + 1} occupied voxels: {per_view_vols[-1].sum().item()}")
 
@@ -1145,6 +1409,188 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             )
         return out_mesh
     
+    @torch.no_grad()
+    def run_multi_image_cond(
+        self,
+        images: List[Image.Image],
+        num_samples: int = 1,
+        seed: int = 42,
+        cond_fusion_mode: str = "mean",
+        sparse_structure_sampler_params: dict = {},
+        shape_slat_sampler_params: dict = {},
+        tex_slat_sampler_params: dict = {},
+        preprocess_image: bool = True,
+        return_latent: bool = False,
+        pipeline_type: Optional[str] = None,
+        max_num_tokens: int = 49152,
+    ) -> List[MeshWithVoxel]:
+        """
+        Run the pipeline with a single joint conditioning tensor built from all
+        input images.
+
+        This is the **condition-fusion** approach described in the research
+        plan: instead of running stage one independently per view and then
+        fusing occupancy volumes (``run_multi_image()``), this method first
+        merges all view embeddings into one conditioning representation and
+        then executes a single stage-one and stage-two pass.  The result is a
+        single coherent object hypothesis rather than a blend of independent
+        per-view completions.
+
+        Fusion modes (``cond_fusion_mode``):
+            ``"mean"``   — average the DINOv3 patch-token sequences from all
+                           views element-wise.  Output shape ``(1, N, D)`` —
+                           plug-in compatible with the existing single-image
+                           flow models.  This is the recommended first
+                           experiment.
+            ``"concat"`` — concatenate token sequences along the token
+                           dimension; output shape ``(1, V*N, D)``.  Provides
+                           richer multi-view context but increases the cross-
+                           attention sequence length in the flow models.
+
+        The texture SLAT stage always uses the **first image** as its primary
+        conditioning view because texture is view-dependent.
+
+        Args:
+            images: PIL images from different viewpoints.  At least two images
+                are expected; a single image falls back to ``run()``.
+            num_samples: Number of output samples (typically 1).
+            seed: Random seed for reproducibility.
+            cond_fusion_mode: How to fuse per-view DINOv3 tokens —
+                ``"mean"`` or ``"concat"``.
+            sparse_structure_sampler_params: Forwarded to stage-one sampling.
+            shape_slat_sampler_params: Forwarded to stage-two sampling.
+            tex_slat_sampler_params: Forwarded to texture-SLAT sampling.
+            preprocess_image: Apply background removal / crop to all images.
+            return_latent: Also return ``(shape_slat, tex_slat, res)``.
+            pipeline_type: ``'512'``, ``'1024'``, ``'1024_cascade'``, or
+                ``'1536_cascade'``.  Defaults to
+                ``self.default_pipeline_type``.
+            max_num_tokens: Token budget for cascade upsampling.
+
+        Returns:
+            ``List[MeshWithVoxel]``, or ``(List[MeshWithVoxel], latents)``
+            when ``return_latent=True``.
+        """
+        if not images:
+            raise ValueError("At least one image is required.")
+        if len(images) == 1:
+            return self.run(
+                images[0],
+                num_samples=num_samples,
+                seed=seed,
+                sparse_structure_sampler_params=sparse_structure_sampler_params,
+                shape_slat_sampler_params=shape_slat_sampler_params,
+                tex_slat_sampler_params=tex_slat_sampler_params,
+                preprocess_image=preprocess_image,
+                return_latent=return_latent,
+                pipeline_type=pipeline_type,
+                max_num_tokens=max_num_tokens,
+            )
+
+        pipeline_type = pipeline_type or self.default_pipeline_type
+        if pipeline_type == '512':
+            assert 'shape_slat_flow_model_512' in self.models
+            assert 'tex_slat_flow_model_512' in self.models
+        elif pipeline_type == '1024':
+            assert 'shape_slat_flow_model_1024' in self.models
+            assert 'tex_slat_flow_model_1024' in self.models
+        elif pipeline_type in ('1024_cascade', '1536_cascade'):
+            assert 'shape_slat_flow_model_512' in self.models
+            assert 'shape_slat_flow_model_1024' in self.models
+            assert 'tex_slat_flow_model_1024' in self.models
+        else:
+            raise ValueError(f"Invalid pipeline_type: {pipeline_type}")
+
+        if preprocess_image:
+            images = [self.preprocess_image(img) for img in images]
+
+        torch.manual_seed(seed)
+
+        # --- Joint conditioning (all views fused into one tensor) ---
+        print(f"[run_multi_image_cond] fusing {len(images)} view(s) "
+              f"with mode={cond_fusion_mode!r} ...")
+        joint_cond_512 = self.get_cond_multi(images, 512, cond_fusion_mode)
+        joint_cond_1024 = (
+            self.get_cond_multi(images, 1024, cond_fusion_mode)
+            if pipeline_type != '512' else None
+        )
+
+        # Primary (first-view) conditioning is used for texture, which is
+        # inherently single-view and should not average appearance across views.
+        primary_cond_512 = self.get_cond([images[0]], 512)
+        primary_cond_1024 = (
+            self.get_cond([images[0]], 1024) if pipeline_type != '512' else None
+        )
+
+        ss_res = {'512': 32, '1024': 64, '1024_cascade': 32, '1536_cascade': 32}[pipeline_type]
+
+        # --- Stage 1: ONE sparse-structure sample from the joint condition ---
+        print(f"[run_multi_image_cond] sampling sparse structure from joint "
+              f"{cond_fusion_mode} condition ...")
+        coords = self.sample_sparse_structure(
+            joint_cond_512, ss_res, num_samples, sparse_structure_sampler_params
+        )
+        print(f"[run_multi_image_cond] sparse structure: {coords.shape[0]} voxels")
+
+        # --- Stage 2: Shape SLAT with joint condition ---
+        if pipeline_type == '512':
+            shape_slat = self.sample_shape_slat(
+                joint_cond_512,
+                self.models['shape_slat_flow_model_512'],
+                coords, shape_slat_sampler_params,
+            )
+            tex_slat = self.sample_tex_slat(
+                primary_cond_512,
+                self.models['tex_slat_flow_model_512'],
+                shape_slat, tex_slat_sampler_params,
+            )
+            res = 512
+
+        elif pipeline_type == '1024':
+            shape_slat = self.sample_shape_slat(
+                joint_cond_1024,
+                self.models['shape_slat_flow_model_1024'],
+                coords, shape_slat_sampler_params,
+            )
+            tex_slat = self.sample_tex_slat(
+                primary_cond_1024,
+                self.models['tex_slat_flow_model_1024'],
+                shape_slat, tex_slat_sampler_params,
+            )
+            res = 1024
+
+        elif pipeline_type == '1024_cascade':
+            shape_slat, res = self.sample_shape_slat_cascade(
+                joint_cond_512, joint_cond_1024,
+                self.models['shape_slat_flow_model_512'],
+                self.models['shape_slat_flow_model_1024'],
+                512, 1024, coords, shape_slat_sampler_params, max_num_tokens,
+            )
+            tex_slat = self.sample_tex_slat(
+                primary_cond_1024,
+                self.models['tex_slat_flow_model_1024'],
+                shape_slat, tex_slat_sampler_params,
+            )
+
+        elif pipeline_type == '1536_cascade':
+            shape_slat, res = self.sample_shape_slat_cascade(
+                joint_cond_512, joint_cond_1024,
+                self.models['shape_slat_flow_model_512'],
+                self.models['shape_slat_flow_model_1024'],
+                512, 1536, coords, shape_slat_sampler_params, max_num_tokens,
+            )
+            tex_slat = self.sample_tex_slat(
+                primary_cond_1024,
+                self.models['tex_slat_flow_model_1024'],
+                shape_slat, tex_slat_sampler_params,
+            )
+
+        torch.cuda.empty_cache()
+        out_mesh = self.decode_latent(shape_slat, tex_slat, res)
+        if return_latent:
+            return out_mesh, (shape_slat, tex_slat, res)
+        return out_mesh
+
     @torch.no_grad()
     def run(
         self,
