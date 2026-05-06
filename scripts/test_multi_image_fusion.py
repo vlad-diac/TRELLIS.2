@@ -55,14 +55,14 @@ def timestamp() -> str:
     return now.strftime("%Y-%m-%dT%H%M%S") + f".{now.microsecond // 1000:03d}"
 
 
-def save_glb(pipeline, mesh, output_dir: str, label: str, texture_size: int, decimation_target: int) -> str:
+def save_glb(pipeline, mesh, res: int, output_dir: str, label: str, texture_size: int, decimation_target: int) -> str:
     glb = o_voxel.postprocess.to_glb(
         vertices=mesh.vertices,
         faces=mesh.faces,
         attr_volume=mesh.attrs,
         coords=mesh.coords,
         attr_layout=pipeline.pbr_attr_layout,
-        grid_size=mesh.voxel_shape[-1],
+        grid_size=res,
         aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
         decimation_target=decimation_target,
         texture_size=texture_size,
@@ -251,7 +251,7 @@ def main() -> None:
 
         if len(images) > 1 or args.compare:
             glb_path = save_glb(
-                pipeline, out_single[0], args.output_dir,
+                pipeline, out_single[0], res_s, args.output_dir,
                 "single", args.texture_size, args.decimation
             )
             print(f"  saved: {glb_path}")
@@ -285,7 +285,7 @@ def main() -> None:
         print(f"  completed in {elapsed_multi:.1f}s")
 
         glb_path = save_glb(
-            pipeline, out_multi[0], args.output_dir,
+            pipeline, out_multi[0], res_m, args.output_dir,
             f"multi_{args.fusion}", args.texture_size, args.decimation
         )
         print(f"  saved: {glb_path}")
