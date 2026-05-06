@@ -363,6 +363,245 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         
         return slat, hr_resolution
 
+    def _sample_occupancy_volume(
+        self,
+        cond: dict,
+        num_samples: int = 1,
+        sampler_params: dict = {},
+    ) -> torch.Tensor:
+        """
+        Run the sparse structure flow model and return the raw decoded boolean
+        occupancy volume instead of thresholded coords.  Used as a building
+        block for multi-view fusion.
+
+        Returns:
+            torch.Tensor: Boolean tensor of shape (B, 1, reso, reso, reso).
+        """
+        flow_model = self.models['sparse_structure_flow_model']
+        reso = flow_model.resolution
+        in_channels = flow_model.in_channels
+        noise = torch.randn(num_samples, in_channels, reso, reso, reso).to(self.device)
+        merged_params = {**self.sparse_structure_sampler_params, **sampler_params}
+        if self.low_vram:
+            flow_model.to(self.device)
+        z_s = self.sparse_structure_sampler.sample(
+            flow_model,
+            noise,
+            **cond,
+            **merged_params,
+            verbose=True,
+            tqdm_desc="Sampling sparse structure (per view)",
+        ).samples
+        if self.low_vram:
+            flow_model.cpu()
+
+        decoder = self.models['sparse_structure_decoder']
+        if self.low_vram:
+            decoder.to(self.device)
+        decoded = decoder(z_s) > 0  # (B, 1, reso, reso, reso) bool
+        if self.low_vram:
+            decoder.cpu()
+        return decoded
+
+    def sample_sparse_structure_multi(
+        self,
+        conds_per_view: List[dict],
+        resolution: int,
+        num_samples: int = 1,
+        sampler_params: dict = {},
+        fusion_mode: str = "union",
+        vote_threshold: float = 0.5,
+    ) -> torch.Tensor:
+        """
+        Run the sparse structure flow model once per view, fuse the resulting
+        occupancy volumes, and return unified sparse coords.
+
+        Args:
+            conds_per_view (List[dict]): One conditioning dict per input image,
+                as returned by ``get_cond()``.
+            resolution (int): Target coord resolution (e.g. 32 for 1024_cascade).
+            num_samples (int): Samples per view (typically 1).
+            sampler_params (dict): Extra sampler kwargs forwarded to each run.
+            fusion_mode (str): ``"union"`` — occupied if *any* view votes yes;
+                ``"vote"`` — occupied if the fraction of views voting yes
+                is >= ``vote_threshold``.
+            vote_threshold (float): Fraction threshold used by ``"vote"`` mode.
+
+        Returns:
+            torch.Tensor: Fused coords tensor of shape (N_occupied, 4)
+                [batch_idx, x, y, z].
+        """
+        per_view_vols = []
+        for view_idx, cond in enumerate(conds_per_view):
+            print(f"[multi-fusion] sampling view {view_idx + 1}/{len(conds_per_view)} ...")
+            vol = self._sample_occupancy_volume(cond, num_samples, sampler_params)
+            per_view_vols.append(vol)
+            print(f"[multi-fusion] view {view_idx + 1} occupied voxels: {vol.sum().item()}")
+
+        # Stack → (n_views, B, 1, reso, reso, reso)
+        stacked = torch.stack(per_view_vols, dim=0)
+
+        if fusion_mode == "union":
+            fused = stacked.any(dim=0)
+        elif fusion_mode == "vote":
+            fused = stacked.float().mean(dim=0) >= vote_threshold
+        else:
+            raise ValueError(f"Unknown fusion_mode: {fusion_mode!r}. Choose 'union' or 'vote'.")
+
+        print(f"[multi-fusion] fused occupancy ({fusion_mode}): {fused.sum().item()} voxels "
+              f"from {len(conds_per_view)} views")
+
+        # Optionally downsample to desired resolution
+        if resolution != fused.shape[2]:
+            ratio = fused.shape[2] // resolution
+            fused = torch.nn.functional.max_pool3d(fused.float(), ratio, ratio, 0) > 0.5
+
+        coords = torch.argwhere(fused)[:, [0, 2, 3, 4]].int()
+        return coords
+
+    @torch.no_grad()
+    def run_multi_image(
+        self,
+        images: List[Image.Image],
+        num_samples: int = 1,
+        seed: int = 42,
+        fusion_mode: str = "union",
+        vote_threshold: float = 0.5,
+        sparse_structure_sampler_params: dict = {},
+        shape_slat_sampler_params: dict = {},
+        tex_slat_sampler_params: dict = {},
+        preprocess_image: bool = True,
+        return_latent: bool = False,
+        pipeline_type: Optional[str] = None,
+        max_num_tokens: int = 49152,
+    ) -> List[MeshWithVoxel]:
+        """
+        Run the pipeline with multiple input images fused at the sparse
+        occupancy stage (Strategy B).
+
+        The sparse structure flow model is run once per image and the
+        resulting occupancy volumes are fused before Shape SLAT generation.
+        Everything downstream is identical to ``run()``.
+
+        Args:
+            images (List[Image.Image]): Input images from different viewpoints.
+                The first image is used as the primary conditioning image for
+                Shape and Texture SLAT generation.
+            num_samples (int): Number of samples (per view, typically 1).
+            seed (int): Random seed.
+            fusion_mode (str): ``"union"`` or ``"vote"``.
+            vote_threshold (float): Fraction threshold for ``"vote"`` mode.
+            sparse_structure_sampler_params (dict): Forwarded to each per-view
+                sparse structure sample step.
+            shape_slat_sampler_params (dict): Forwarded to shape SLAT sampling.
+            tex_slat_sampler_params (dict): Forwarded to texture SLAT sampling.
+            preprocess_image (bool): Apply background removal / crop to all
+                images before processing.
+            return_latent (bool): Whether to also return
+                ``(shape_slat, tex_slat, res)``.
+            pipeline_type (str): Same options as ``run()``.
+            max_num_tokens (int): Token cap for cascade upsampling.
+
+        Returns:
+            List[MeshWithVoxel], or (List[MeshWithVoxel], latents) when
+            ``return_latent=True``.
+        """
+        if not images:
+            raise ValueError("At least one image is required.")
+
+        pipeline_type = pipeline_type or self.default_pipeline_type
+        if pipeline_type == '512':
+            assert 'shape_slat_flow_model_512' in self.models
+            assert 'tex_slat_flow_model_512' in self.models
+        elif pipeline_type == '1024':
+            assert 'shape_slat_flow_model_1024' in self.models
+            assert 'tex_slat_flow_model_1024' in self.models
+        elif pipeline_type in ('1024_cascade', '1536_cascade'):
+            assert 'shape_slat_flow_model_512' in self.models
+            assert 'shape_slat_flow_model_1024' in self.models
+            assert 'tex_slat_flow_model_1024' in self.models
+        else:
+            raise ValueError(f"Invalid pipeline_type: {pipeline_type}")
+
+        if preprocess_image:
+            images = [self.preprocess_image(img) for img in images]
+
+        torch.manual_seed(seed)
+
+        # --- per-view conditioning at 512 px (used for occupancy fusion) ---
+        print(f"[run_multi_image] extracting conditioning for {len(images)} image(s) ...")
+        conds_512 = [self.get_cond([img], 512) for img in images]
+
+        # --- primary conditioning for SLAT (first / only image) ---
+        cond_512_primary = conds_512[0]
+        cond_1024_primary = self.get_cond([images[0]], 1024) if pipeline_type != '512' else None
+
+        ss_res = {'512': 32, '1024': 64, '1024_cascade': 32, '1536_cascade': 32}[pipeline_type]
+
+        # --- fused sparse occupancy ---
+        if len(images) == 1:
+            # Single-image path: reuse the existing method for consistency
+            coords = self.sample_sparse_structure(
+                conds_512[0], ss_res, num_samples, sparse_structure_sampler_params
+            )
+        else:
+            coords = self.sample_sparse_structure_multi(
+                conds_512, ss_res, num_samples,
+                sparse_structure_sampler_params,
+                fusion_mode=fusion_mode,
+                vote_threshold=vote_threshold,
+            )
+
+        # --- rest of pipeline identical to run() ---
+        if pipeline_type == '512':
+            shape_slat = self.sample_shape_slat(
+                cond_512_primary, self.models['shape_slat_flow_model_512'],
+                coords, shape_slat_sampler_params,
+            )
+            tex_slat = self.sample_tex_slat(
+                cond_512_primary, self.models['tex_slat_flow_model_512'],
+                shape_slat, tex_slat_sampler_params,
+            )
+            res = 512
+        elif pipeline_type == '1024':
+            shape_slat = self.sample_shape_slat(
+                cond_1024_primary, self.models['shape_slat_flow_model_1024'],
+                coords, shape_slat_sampler_params,
+            )
+            tex_slat = self.sample_tex_slat(
+                cond_1024_primary, self.models['tex_slat_flow_model_1024'],
+                shape_slat, tex_slat_sampler_params,
+            )
+            res = 1024
+        elif pipeline_type == '1024_cascade':
+            shape_slat, res = self.sample_shape_slat_cascade(
+                cond_512_primary, cond_1024_primary,
+                self.models['shape_slat_flow_model_512'], self.models['shape_slat_flow_model_1024'],
+                512, 1024,
+                coords, shape_slat_sampler_params, max_num_tokens,
+            )
+            tex_slat = self.sample_tex_slat(
+                cond_1024_primary, self.models['tex_slat_flow_model_1024'],
+                shape_slat, tex_slat_sampler_params,
+            )
+        elif pipeline_type == '1536_cascade':
+            shape_slat, res = self.sample_shape_slat_cascade(
+                cond_512_primary, cond_1024_primary,
+                self.models['shape_slat_flow_model_512'], self.models['shape_slat_flow_model_1024'],
+                512, 1536,
+                coords, shape_slat_sampler_params, max_num_tokens,
+            )
+            tex_slat = self.sample_tex_slat(
+                cond_1024_primary, self.models['tex_slat_flow_model_1024'],
+                shape_slat, tex_slat_sampler_params,
+            )
+
+        torch.cuda.empty_cache()
+        out_mesh = self.decode_latent(shape_slat, tex_slat, res)
+        if return_latent:
+            return out_mesh, (shape_slat, tex_slat, res)
+        return out_mesh
+
     def decode_shape_slat(
         self,
         slat: SparseTensor,
