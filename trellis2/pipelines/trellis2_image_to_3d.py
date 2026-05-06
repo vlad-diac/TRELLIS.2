@@ -369,7 +369,8 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         num_samples: int = 1,
         sampler_params: dict = {},
         samples_per_view: int = 1,
-    ) -> torch.Tensor:
+        return_logits: bool = False,
+    ):
         """
         Run the sparse structure flow model and return the decoded boolean
         occupancy volume.  Used as a building block for multi-view fusion.
@@ -386,9 +387,15 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             sampler_params (dict): Extra sampler kwargs.
             samples_per_view (int): Number of independent diffusion runs to
                 average *before* thresholding (default 1 = no ensemble).
+            return_logits (bool): When True, return a
+                ``(decoded_bool, mean_logits)`` tuple where ``mean_logits`` is
+                the raw float tensor of shape (B, 1, reso, reso, reso) before
+                the ``> 0`` threshold is applied.  Default False preserves the
+                original single-return behaviour.
 
         Returns:
-            torch.Tensor: Boolean tensor of shape (B, 1, reso, reso, reso).
+            torch.Tensor: Boolean tensor of shape (B, 1, reso, reso, reso), or
+            a ``(bool_tensor, float_tensor)`` tuple when ``return_logits=True``.
         """
         flow_model = self.models['sparse_structure_flow_model']
         reso = flow_model.resolution
@@ -428,6 +435,8 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         # Average logits across ensemble runs, then threshold at 0
         mean_logits = torch.stack(raw_logits_list, dim=0).mean(dim=0)
         decoded = mean_logits > 0  # (B, 1, reso, reso, reso) bool
+        if return_logits:
+            return decoded, mean_logits
         return decoded
 
     @staticmethod
@@ -448,12 +457,47 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         if min_neighbors <= 0:
             return vol
         import torch.nn.functional as F
-        kernel = torch.ones(1, 1, 3, 3, 3, dtype=vol.dtype, device=vol.device)
+        kernel = torch.ones(1, 1, 3, 3, 3, dtype=torch.float32, device=vol.device)
         # Count all occupied voxels in each 3×3×3 window (including self)
         neighbor_count = F.conv3d(vol.float(), kernel, padding=1)
         # Subtract self so we count only neighbours
         neighbor_count = neighbor_count - vol.float()
         return vol & (neighbor_count >= min_neighbors)
+
+    @staticmethod
+    def _smooth_logit_volume(logits: torch.Tensor, sigma: float) -> torch.Tensor:
+        """
+        Apply a 3-D Gaussian blur to a float logit volume before thresholding.
+
+        Voxels with weak scores are reinforced by strongly-occupied neighbours,
+        implementing "probabilistic spatial diffusion".  The kernel is built
+        analytically so no learned weights are required.
+
+        Args:
+            logits (torch.Tensor): Float tensor of shape (B, 1, X, Y, Z).
+            sigma (float): Gaussian standard deviation in voxels.  Values of
+                0.5–1.5 give useful smoothing; 0.0 is a no-op identity.
+
+        Returns:
+            torch.Tensor: Smoothed float tensor, same shape.
+        """
+        if sigma <= 0.0:
+            return logits
+        import torch.nn.functional as F
+        import math
+
+        radius = math.ceil(2.0 * sigma)
+        size = 2 * radius + 1
+
+        # Build a 1-D Gaussian, then outer-product to 3-D
+        coords_1d = torch.arange(size, dtype=torch.float32, device=logits.device) - radius
+        gauss_1d = torch.exp(-0.5 * (coords_1d / sigma) ** 2)
+        gauss_1d = gauss_1d / gauss_1d.sum()
+
+        kernel = gauss_1d[:, None, None] * gauss_1d[None, :, None] * gauss_1d[None, None, :]
+        kernel = kernel.view(1, 1, size, size, size)
+
+        return F.conv3d(logits.float(), kernel, padding=radius)
 
     def sample_sparse_structure_multi(
         self,
@@ -463,12 +507,21 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         sampler_params: dict = {},
         fusion_mode: str = "union",
         vote_threshold: float = 0.5,
+        logit_threshold: float = 0.0,
+        logit_smooth_sigma: float = 0.0,
         samples_per_view: int = 1,
         filter_min_neighbors: int = 0,
     ) -> torch.Tensor:
         """
         Run the sparse structure flow model once per view, fuse the resulting
         occupancy volumes, and return unified sparse coords.
+
+        Binary fusion modes (``union``, ``vote``) threshold each view's
+        occupancy **before** cross-view merging.  Logit fusion modes
+        (``logit-mean``, ``logit-max``, ``logit-sum``) preserve the raw
+        decoder float scores across all views and apply a **single** threshold
+        after fusion, retaining weak-evidence voxels that would otherwise be
+        discarded by per-view thresholding.
 
         Args:
             conds_per_view (List[dict]): One conditioning dict per input image,
@@ -477,10 +530,23 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             num_samples (int): Batch size per view (typically 1).
             sampler_params (dict): Extra sampler kwargs forwarded to each run.
             fusion_mode (str):
-                ``"union"`` — voxel occupied if *any* view votes yes.
-                ``"vote"``  — voxel occupied if fraction of views voting yes
-                              >= ``vote_threshold``.
+                ``"union"``      — occupied if *any* view votes yes (binary).
+                ``"vote"``       — occupied if fraction >= ``vote_threshold``
+                                   (binary).
+                ``"logit-mean"`` — fuse raw logits by averaging across views,
+                                   then threshold at ``logit_threshold``.
+                ``"logit-max"``  — fuse by taking the per-voxel maximum logit,
+                                   then threshold at ``logit_threshold``.
+                ``"logit-sum"``  — fuse by summing logits across views, then
+                                   threshold at ``logit_threshold``.
             vote_threshold (float): Fraction threshold for ``"vote"`` mode.
+            logit_threshold (float): Threshold applied to the fused logit
+                volume in logit-* modes (default 0.0 ≈ decoder decision
+                boundary).
+            logit_smooth_sigma (float): If > 0, apply a 3-D Gaussian blur with
+                this sigma (in voxels) to the fused logit volume before
+                thresholding.  Reinforces weak-evidence regions surrounded by
+                stronger neighbours.  0.0 = disabled (default).
             samples_per_view (int): Number of independent diffusion runs
                 averaged *within* each view before cross-view fusion.
                 Values of 3–5 reduce per-view hallucinations at the cost of
@@ -494,26 +560,63 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             torch.Tensor: Fused coords tensor of shape (N_occupied, 4)
                 [batch_idx, x, y, z].
         """
-        per_view_vols = []
+        _LOGIT_MODES = {"logit-mean", "logit-max", "logit-sum"}
+        use_logit_fusion = fusion_mode in _LOGIT_MODES
+
+        per_view_vols = []   # bool tensors for binary modes
+        per_view_logits = [] # float tensors for logit modes
+
         for view_idx, cond in enumerate(conds_per_view):
             print(f"[multi-fusion] sampling view {view_idx + 1}/{len(conds_per_view)}"
                   + (f" (×{samples_per_view} ensemble)" if samples_per_view > 1 else "") + " ...")
-            vol = self._sample_occupancy_volume(cond, num_samples, sampler_params, samples_per_view)
-            per_view_vols.append(vol)
-            print(f"[multi-fusion] view {view_idx + 1} occupied voxels: {vol.sum().item()}")
+            if use_logit_fusion:
+                vol, logits = self._sample_occupancy_volume(
+                    cond, num_samples, sampler_params, samples_per_view, return_logits=True
+                )
+                per_view_logits.append(logits)
+                per_view_vols.append(vol)
+            else:
+                vol = self._sample_occupancy_volume(cond, num_samples, sampler_params, samples_per_view)
+                per_view_vols.append(vol)
+            print(f"[multi-fusion] view {view_idx + 1} occupied voxels: {per_view_vols[-1].sum().item()}")
 
-        # Stack → (n_views, B, 1, reso, reso, reso)
-        stacked = torch.stack(per_view_vols, dim=0)
+        if use_logit_fusion:
+            # Stack logits → (n_views, B, 1, reso, reso, reso)
+            stacked_logits = torch.stack(per_view_logits, dim=0)
 
-        if fusion_mode == "union":
-            fused = stacked.any(dim=0)
-        elif fusion_mode == "vote":
-            fused = stacked.float().mean(dim=0) >= vote_threshold
+            if fusion_mode == "logit-mean":
+                fused_logits = stacked_logits.mean(dim=0)
+            elif fusion_mode == "logit-max":
+                fused_logits = stacked_logits.max(dim=0).values
+            elif fusion_mode == "logit-sum":
+                fused_logits = stacked_logits.sum(dim=0)
+
+            if logit_smooth_sigma > 0.0:
+                before_smooth = int((fused_logits > logit_threshold).sum().item())
+                fused_logits = self._smooth_logit_volume(fused_logits, logit_smooth_sigma)
+                after_smooth = int((fused_logits > logit_threshold).sum().item())
+                print(f"[multi-fusion] logit smoothing (sigma={logit_smooth_sigma}): "
+                      f"{before_smooth} → {after_smooth} voxels above threshold")
+
+            fused = fused_logits > logit_threshold
+            print(f"[multi-fusion] fused occupancy ({fusion_mode}, thr={logit_threshold}): "
+                  f"{fused.sum().item()} voxels from {len(conds_per_view)} views")
         else:
-            raise ValueError(f"Unknown fusion_mode: {fusion_mode!r}. Choose 'union' or 'vote'.")
+            # Stack bool volumes → (n_views, B, 1, reso, reso, reso)
+            stacked = torch.stack(per_view_vols, dim=0)
 
-        print(f"[multi-fusion] fused occupancy ({fusion_mode}): {fused.sum().item()} voxels "
-              f"from {len(conds_per_view)} views")
+            if fusion_mode == "union":
+                fused = stacked.any(dim=0)
+            elif fusion_mode == "vote":
+                fused = stacked.float().mean(dim=0) >= vote_threshold
+            else:
+                raise ValueError(
+                    f"Unknown fusion_mode: {fusion_mode!r}. "
+                    f"Choose 'union', 'vote', 'logit-mean', 'logit-max', or 'logit-sum'."
+                )
+
+            print(f"[multi-fusion] fused occupancy ({fusion_mode}): {fused.sum().item()} voxels "
+                  f"from {len(conds_per_view)} views")
 
         # Optional neighbourhood filter to remove isolated hallucination voxels
         if filter_min_neighbors > 0:
@@ -539,6 +642,8 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         seed: int = 42,
         fusion_mode: str = "union",
         vote_threshold: float = 0.5,
+        logit_threshold: float = 0.0,
+        logit_smooth_sigma: float = 0.0,
         samples_per_view: int = 1,
         filter_min_neighbors: int = 0,
         sparse_structure_sampler_params: dict = {},
@@ -563,8 +668,13 @@ class Trellis2ImageTo3DPipeline(Pipeline):
                 Shape and Texture SLAT generation.
             num_samples (int): Number of samples (per view, typically 1).
             seed (int): Random seed.
-            fusion_mode (str): ``"union"`` or ``"vote"``.
+            fusion_mode (str): ``"union"``, ``"vote"``, ``"logit-mean"``,
+                ``"logit-max"``, or ``"logit-sum"``.
             vote_threshold (float): Fraction threshold for ``"vote"`` mode.
+            logit_threshold (float): Threshold applied after logit fusion in
+                ``logit-*`` modes (default 0.0).
+            logit_smooth_sigma (float): Gaussian spatial smoothing sigma
+                applied to fused logits before thresholding (0.0 = off).
             samples_per_view (int): Independent diffusion runs averaged within
                 each view before cross-view fusion (1 = disabled).
             filter_min_neighbors (int): Post-fusion neighbourhood filter;
@@ -628,6 +738,8 @@ class Trellis2ImageTo3DPipeline(Pipeline):
                 sparse_structure_sampler_params,
                 fusion_mode=fusion_mode,
                 vote_threshold=vote_threshold,
+                logit_threshold=logit_threshold,
+                logit_smooth_sigma=logit_smooth_sigma,
                 samples_per_view=samples_per_view,
                 filter_min_neighbors=filter_min_neighbors,
             )

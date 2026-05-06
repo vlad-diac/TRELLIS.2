@@ -14,10 +14,22 @@ python scripts/test_multi_image_fusion.py front.png side.png rear.png \\
 python scripts/test_multi_image_fusion.py front.png side.png rear.png \\
     --fusion vote --vote-threshold 0.5 --output-dir ./out
 
+# Logit-mean fusion (fuse raw decoder scores, single threshold at 0.0)
+python scripts/test_multi_image_fusion.py front.png side.png rear.png \\
+    --fusion logit-mean --output-dir ./out
+
+# Logit-max fusion with spatial smoothing
+python scripts/test_multi_image_fusion.py front.png side.png rear.png \\
+    --fusion logit-max --logit-smooth-sigma 0.8 --output-dir ./out
+
+# Logit-mean + ensemble ×3 (most evidence, 3× sparse-stage compute)
+python scripts/test_multi_image_fusion.py front.png side.png rear.png \\
+    --fusion logit-mean --samples-per-view 3 --output-dir ./out
+
 # Side-by-side comparison: runs single-image baseline AND multi-image fusion,
 # saves both GLBs, prints voxel count statistics.
 python scripts/test_multi_image_fusion.py front.png side.png rear.png \\
-    --compare --fusion union --output-dir ./out
+    --compare --fusion logit-mean --output-dir ./out
 
 # Use a lower-resolution pipeline to speed up testing
 python scripts/test_multi_image_fusion.py front.png side.png \\
@@ -111,15 +123,43 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--fusion",
-        choices=["union", "vote"],
+        choices=["union", "vote", "logit-mean", "logit-max", "logit-sum"],
         default="union",
-        help="Occupancy fusion mode (default: union).",
+        help=(
+            "Occupancy fusion mode (default: union).  "
+            "'union'/'vote' threshold each view first then merge (binary).  "
+            "'logit-mean'/'logit-max'/'logit-sum' preserve raw decoder scores "
+            "across all views and apply a single threshold after fusion."
+        ),
     )
     parser.add_argument(
         "--vote-threshold",
         type=float,
         default=0.5,
         help="Fraction of views that must agree for 'vote' mode (default: 0.5).",
+    )
+    parser.add_argument(
+        "--logit-threshold",
+        type=float,
+        default=0.0,
+        metavar="T",
+        help=(
+            "Threshold applied to the fused logit volume in logit-* modes "
+            "(default: 0.0, the decoder's natural decision boundary).  "
+            "Lower values keep more voxels; raise to tighten."
+        ),
+    )
+    parser.add_argument(
+        "--logit-smooth-sigma",
+        type=float,
+        default=0.0,
+        metavar="S",
+        help=(
+            "Gaussian spatial smoothing sigma (in voxels) applied to the "
+            "fused logit volume before thresholding in logit-* modes.  "
+            "Reinforces weak-evidence voxels surrounded by stronger neighbours.  "
+            "0.0 = disabled (default).  0.5–1.5 is a good starting range."
+        ),
     )
     parser.add_argument(
         "--samples-per-view",
@@ -288,6 +328,11 @@ def main() -> None:
         extras = []
         if args.fusion == "vote":
             extras.append(f"threshold={args.vote_threshold}")
+        if args.fusion in ("logit-mean", "logit-max", "logit-sum"):
+            if args.logit_threshold != 0.0:
+                extras.append(f"thr={args.logit_threshold}")
+            if args.logit_smooth_sigma > 0.0:
+                extras.append(f"smooth={args.logit_smooth_sigma}")
         if args.samples_per_view > 1:
             extras.append(f"×{args.samples_per_view}/view")
         if args.filter_min_neighbors > 0:
@@ -303,6 +348,8 @@ def main() -> None:
             seed=args.seed,
             fusion_mode=args.fusion,
             vote_threshold=args.vote_threshold,
+            logit_threshold=args.logit_threshold,
+            logit_smooth_sigma=args.logit_smooth_sigma,
             samples_per_view=args.samples_per_view,
             filter_min_neighbors=args.filter_min_neighbors,
             preprocess_image=preprocess,
@@ -315,7 +362,12 @@ def main() -> None:
         elapsed_multi = time.time() - t0
         print(f"  completed in {elapsed_multi:.1f}s")
 
-        file_label_parts = [f"multi_{args.fusion}"]
+        file_label_parts = [f"multi_{args.fusion.replace('-', '_')}"]
+        if args.fusion in ("logit-mean", "logit-max", "logit-sum"):
+            if args.logit_threshold != 0.0:
+                file_label_parts.append(f"thr{args.logit_threshold}")
+            if args.logit_smooth_sigma > 0.0:
+                file_label_parts.append(f"sm{args.logit_smooth_sigma}")
         if args.samples_per_view > 1:
             file_label_parts.append(f"spv{args.samples_per_view}")
         if args.filter_min_neighbors > 0:
