@@ -122,6 +122,29 @@ def parse_args() -> argparse.Namespace:
         help="Fraction of views that must agree for 'vote' mode (default: 0.5).",
     )
     parser.add_argument(
+        "--samples-per-view",
+        type=int,
+        default=1,
+        metavar="N",
+        help=(
+            "Run diffusion N times per view and average raw logits before "
+            "thresholding.  Reduces per-view hallucinations at N× the compute "
+            "cost.  3–5 is a good range (default: 1 = no ensemble)."
+        ),
+    )
+    parser.add_argument(
+        "--filter-min-neighbors",
+        type=int,
+        default=0,
+        metavar="K",
+        help=(
+            "After fusion, remove voxels with fewer than K occupied neighbours "
+            "in their 3×3×3 block.  Cleans floating hallucination islands "
+            "without eroding real geometry.  0 = disabled (default).  "
+            "Recommended starting point: 2."
+        ),
+    )
+    parser.add_argument(
         "--compare",
         action="store_true",
         help="Also run a single-image baseline for comparison.",
@@ -262,10 +285,16 @@ def main() -> None:
     # Multi-image fusion (only when more than one image is supplied)
     # -----------------------------------------------------------------------
     if len(images) > 1:
+        extras = []
+        if args.fusion == "vote":
+            extras.append(f"threshold={args.vote_threshold}")
+        if args.samples_per_view > 1:
+            extras.append(f"×{args.samples_per_view}/view")
+        if args.filter_min_neighbors > 0:
+            extras.append(f"filter≥{args.filter_min_neighbors}nb")
+        label_extras = (", " + ", ".join(extras)) if extras else ""
         print_section(
-            f"Multi-image fusion  [{args.fusion}"
-            + (f", threshold={args.vote_threshold}" if args.fusion == "vote" else "")
-            + f"]  ({len(images)} images)"
+            f"Multi-image fusion  [{args.fusion}{label_extras}]  ({len(images)} images)"
         )
         t0 = time.time()
 
@@ -274,6 +303,8 @@ def main() -> None:
             seed=args.seed,
             fusion_mode=args.fusion,
             vote_threshold=args.vote_threshold,
+            samples_per_view=args.samples_per_view,
+            filter_min_neighbors=args.filter_min_neighbors,
             preprocess_image=preprocess,
             sparse_structure_sampler_params=ss_params,
             shape_slat_sampler_params=shape_params,
@@ -284,9 +315,14 @@ def main() -> None:
         elapsed_multi = time.time() - t0
         print(f"  completed in {elapsed_multi:.1f}s")
 
+        file_label_parts = [f"multi_{args.fusion}"]
+        if args.samples_per_view > 1:
+            file_label_parts.append(f"spv{args.samples_per_view}")
+        if args.filter_min_neighbors > 0:
+            file_label_parts.append(f"fn{args.filter_min_neighbors}")
         glb_path = save_glb(
             pipeline, out_multi[0], res_m, args.output_dir,
-            f"multi_{args.fusion}", args.texture_size, args.decimation
+            "_".join(file_label_parts), args.texture_size, args.decimation
         )
         print(f"  saved: {glb_path}")
 

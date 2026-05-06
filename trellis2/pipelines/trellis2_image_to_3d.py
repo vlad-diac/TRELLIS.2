@@ -368,11 +368,24 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         cond: dict,
         num_samples: int = 1,
         sampler_params: dict = {},
+        samples_per_view: int = 1,
     ) -> torch.Tensor:
         """
-        Run the sparse structure flow model and return the raw decoded boolean
-        occupancy volume instead of thresholded coords.  Used as a building
-        block for multi-view fusion.
+        Run the sparse structure flow model and return the decoded boolean
+        occupancy volume.  Used as a building block for multi-view fusion.
+
+        When ``samples_per_view > 1`` the flow model is run that many times
+        with independent noise seeds and the raw decoder logits are averaged
+        before thresholding at 0.  This intra-view ensemble suppresses
+        per-run hallucinations and produces a more reliable single-view
+        occupancy prediction.
+
+        Args:
+            cond (dict): Conditioning dict from ``get_cond()``.
+            num_samples (int): Batch dimension (typically 1).
+            sampler_params (dict): Extra sampler kwargs.
+            samples_per_view (int): Number of independent diffusion runs to
+                average *before* thresholding (default 1 = no ensemble).
 
         Returns:
             torch.Tensor: Boolean tensor of shape (B, 1, reso, reso, reso).
@@ -380,28 +393,67 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         flow_model = self.models['sparse_structure_flow_model']
         reso = flow_model.resolution
         in_channels = flow_model.in_channels
-        noise = torch.randn(num_samples, in_channels, reso, reso, reso).to(self.device)
         merged_params = {**self.sparse_structure_sampler_params, **sampler_params}
+
         if self.low_vram:
             flow_model.to(self.device)
-        z_s = self.sparse_structure_sampler.sample(
-            flow_model,
-            noise,
-            **cond,
-            **merged_params,
-            verbose=True,
-            tqdm_desc="Sampling sparse structure (per view)",
-        ).samples
+
+        raw_logits_list = []
+        for run_idx in range(samples_per_view):
+            noise = torch.randn(num_samples, in_channels, reso, reso, reso).to(self.device)
+            z_s = self.sparse_structure_sampler.sample(
+                flow_model,
+                noise,
+                **cond,
+                **merged_params,
+                verbose=True,
+                tqdm_desc=f"Sampling sparse structure (per view, run {run_idx + 1}/{samples_per_view})",
+            ).samples
+
+            decoder = self.models['sparse_structure_decoder']
+            if self.low_vram:
+                flow_model.cpu()
+                decoder.to(self.device)
+
+            raw_logits = decoder(z_s)  # (B, 1, reso, reso, reso) float logits
+            raw_logits_list.append(raw_logits)
+
+            if self.low_vram:
+                decoder.cpu()
+                flow_model.to(self.device)
+
         if self.low_vram:
             flow_model.cpu()
 
-        decoder = self.models['sparse_structure_decoder']
-        if self.low_vram:
-            decoder.to(self.device)
-        decoded = decoder(z_s) > 0  # (B, 1, reso, reso, reso) bool
-        if self.low_vram:
-            decoder.cpu()
+        # Average logits across ensemble runs, then threshold at 0
+        mean_logits = torch.stack(raw_logits_list, dim=0).mean(dim=0)
+        decoded = mean_logits > 0  # (B, 1, reso, reso, reso) bool
         return decoded
+
+    @staticmethod
+    def _filter_isolated_voxels(vol: torch.Tensor, min_neighbors: int) -> torch.Tensor:
+        """
+        Remove voxels that have fewer than ``min_neighbors`` occupied neighbors
+        in their 3×3×3 neighbourhood.  Applied after cross-view fusion to
+        discard floating hallucination islands while preserving contiguous
+        geometry.
+
+        Args:
+            vol (torch.Tensor): Boolean tensor (B, 1, X, Y, Z).
+            min_neighbors (int): Minimum required occupied neighbours (1–26).
+
+        Returns:
+            torch.Tensor: Filtered boolean tensor, same shape.
+        """
+        if min_neighbors <= 0:
+            return vol
+        import torch.nn.functional as F
+        kernel = torch.ones(1, 1, 3, 3, 3, dtype=vol.dtype, device=vol.device)
+        # Count all occupied voxels in each 3×3×3 window (including self)
+        neighbor_count = F.conv3d(vol.float(), kernel, padding=1)
+        # Subtract self so we count only neighbours
+        neighbor_count = neighbor_count - vol.float()
+        return vol & (neighbor_count >= min_neighbors)
 
     def sample_sparse_structure_multi(
         self,
@@ -411,6 +463,8 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         sampler_params: dict = {},
         fusion_mode: str = "union",
         vote_threshold: float = 0.5,
+        samples_per_view: int = 1,
+        filter_min_neighbors: int = 0,
     ) -> torch.Tensor:
         """
         Run the sparse structure flow model once per view, fuse the resulting
@@ -420,12 +474,21 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             conds_per_view (List[dict]): One conditioning dict per input image,
                 as returned by ``get_cond()``.
             resolution (int): Target coord resolution (e.g. 32 for 1024_cascade).
-            num_samples (int): Samples per view (typically 1).
+            num_samples (int): Batch size per view (typically 1).
             sampler_params (dict): Extra sampler kwargs forwarded to each run.
-            fusion_mode (str): ``"union"`` — occupied if *any* view votes yes;
-                ``"vote"`` — occupied if the fraction of views voting yes
-                is >= ``vote_threshold``.
-            vote_threshold (float): Fraction threshold used by ``"vote"`` mode.
+            fusion_mode (str):
+                ``"union"`` — voxel occupied if *any* view votes yes.
+                ``"vote"``  — voxel occupied if fraction of views voting yes
+                              >= ``vote_threshold``.
+            vote_threshold (float): Fraction threshold for ``"vote"`` mode.
+            samples_per_view (int): Number of independent diffusion runs
+                averaged *within* each view before cross-view fusion.
+                Values of 3–5 reduce per-view hallucinations at the cost of
+                proportionally more compute.  Default is 1 (no ensemble).
+            filter_min_neighbors (int): After fusion, remove voxels with fewer
+                than this many occupied neighbours in their 3×3×3 block.
+                0 = disabled (default).  2–4 is a good range for cleaning
+                isolated hallucination islands without eroding real geometry.
 
         Returns:
             torch.Tensor: Fused coords tensor of shape (N_occupied, 4)
@@ -433,8 +496,9 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         """
         per_view_vols = []
         for view_idx, cond in enumerate(conds_per_view):
-            print(f"[multi-fusion] sampling view {view_idx + 1}/{len(conds_per_view)} ...")
-            vol = self._sample_occupancy_volume(cond, num_samples, sampler_params)
+            print(f"[multi-fusion] sampling view {view_idx + 1}/{len(conds_per_view)}"
+                  + (f" (×{samples_per_view} ensemble)" if samples_per_view > 1 else "") + " ...")
+            vol = self._sample_occupancy_volume(cond, num_samples, sampler_params, samples_per_view)
             per_view_vols.append(vol)
             print(f"[multi-fusion] view {view_idx + 1} occupied voxels: {vol.sum().item()}")
 
@@ -450,6 +514,14 @@ class Trellis2ImageTo3DPipeline(Pipeline):
 
         print(f"[multi-fusion] fused occupancy ({fusion_mode}): {fused.sum().item()} voxels "
               f"from {len(conds_per_view)} views")
+
+        # Optional neighbourhood filter to remove isolated hallucination voxels
+        if filter_min_neighbors > 0:
+            before = int(fused.sum().item())
+            fused = self._filter_isolated_voxels(fused, filter_min_neighbors)
+            after = int(fused.sum().item())
+            print(f"[multi-fusion] neighbour filter (min_neighbors={filter_min_neighbors}): "
+                  f"{before} → {after} voxels (removed {before - after})")
 
         # Optionally downsample to desired resolution
         if resolution != fused.shape[2]:
@@ -467,6 +539,8 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         seed: int = 42,
         fusion_mode: str = "union",
         vote_threshold: float = 0.5,
+        samples_per_view: int = 1,
+        filter_min_neighbors: int = 0,
         sparse_structure_sampler_params: dict = {},
         shape_slat_sampler_params: dict = {},
         tex_slat_sampler_params: dict = {},
@@ -491,6 +565,10 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             seed (int): Random seed.
             fusion_mode (str): ``"union"`` or ``"vote"``.
             vote_threshold (float): Fraction threshold for ``"vote"`` mode.
+            samples_per_view (int): Independent diffusion runs averaged within
+                each view before cross-view fusion (1 = disabled).
+            filter_min_neighbors (int): Post-fusion neighbourhood filter;
+                0 = disabled.
             sparse_structure_sampler_params (dict): Forwarded to each per-view
                 sparse structure sample step.
             shape_slat_sampler_params (dict): Forwarded to shape SLAT sampling.
@@ -550,6 +628,8 @@ class Trellis2ImageTo3DPipeline(Pipeline):
                 sparse_structure_sampler_params,
                 fusion_mode=fusion_mode,
                 vote_threshold=vote_threshold,
+                samples_per_view=samples_per_view,
+                filter_min_neighbors=filter_min_neighbors,
             )
 
         # --- rest of pipeline identical to run() ---
