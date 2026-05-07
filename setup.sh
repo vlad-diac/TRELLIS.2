@@ -119,16 +119,22 @@ if [ "$NVDIFFREC" = true ] ; then
     fi
 fi
 
+# MAX_JOBS=1 and TORCH_CUDA_ARCH_LIST="8.6" are required for RunPod pods:
+# - RunPod containers have a ~29 GB cgroup memory cap regardless of system RAM.
+# - Parallel nvcc jobs (ninja default = all CPU cores) each consume 2-4 GB, OOM-killing the build.
+# - MAX_JOBS=1 keeps peak usage under 6 GB. Builds are slower but reliable.
+# - TORCH_CUDA_ARCH_LIST="8.6" targets RTX 3090/3090 Ti only, reducing compile work.
+
 if [ "$CUMESH" = true ] ; then
     mkdir -p /tmp/extensions
     git clone https://github.com/JeffreyXiang/CuMesh.git /tmp/extensions/CuMesh --recursive
-    MAX_JOBS=4 TORCH_CUDA_ARCH_LIST="8.6" pip install /tmp/extensions/CuMesh --no-build-isolation
+    MAX_JOBS=1 TORCH_CUDA_ARCH_LIST="8.6" pip install /tmp/extensions/CuMesh --no-build-isolation
 fi
 
 if [ "$FLEXGEMM" = true ] ; then
     mkdir -p /tmp/extensions
     git clone https://github.com/JeffreyXiang/FlexGEMM.git /tmp/extensions/FlexGEMM --recursive
-    MAX_JOBS=4 TORCH_CUDA_ARCH_LIST="8.6" pip install /tmp/extensions/FlexGEMM --no-build-isolation
+    MAX_JOBS=1 TORCH_CUDA_ARCH_LIST="8.6" pip install /tmp/extensions/FlexGEMM --no-build-isolation
 fi
 
 if [ "$OVOXEL" = true ] ; then
@@ -136,5 +142,5 @@ if [ "$OVOXEL" = true ] ; then
     git submodule update --init -- o-voxel/third_party/eigen
     rm -rf /tmp/extensions/o-voxel
     cp -r o-voxel /tmp/extensions/o-voxel
-    MAX_JOBS=4 TORCH_CUDA_ARCH_LIST="8.6" pip install /tmp/extensions/o-voxel --no-build-isolation --no-deps
+    MAX_JOBS=1 TORCH_CUDA_ARCH_LIST="8.6" pip install /tmp/extensions/o-voxel --no-build-isolation --no-deps
 fi
