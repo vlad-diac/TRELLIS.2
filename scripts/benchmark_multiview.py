@@ -425,6 +425,7 @@ def _run_stages(
             meshes[0].fill_holes()
             model_path = save_obj(meshes[0], cond_dir)
         stage_times["decode_s"] = round(t[0], 2)
+        del shape_slat
 
     else:
         cond_tex = cond_1024 if cond_1024 is not None else cond_512
@@ -444,6 +445,14 @@ def _run_stages(
                 args.texture_size, args.decimation_target,
             )
         stage_times["decode_s"] = round(t[0], 2)
+        del shape_slat, tex_slat
+
+    # Free conditioning + SLAT tensors before the preview renderer allocates
+    # its buffers.  The pipeline weights (~22.6 GiB) stay loaded; we only
+    # need to reclaim the working tensors (~300–600 MiB) so nvdiffrast can
+    # render.
+    del cond_512, cond_1024
+    torch.cuda.empty_cache()
 
     if model_path:
         print(f"       → {model_path}")
