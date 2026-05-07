@@ -122,13 +122,13 @@ fi
 if [ "$CUMESH" = true ] ; then
     mkdir -p /tmp/extensions
     git clone https://github.com/JeffreyXiang/CuMesh.git /tmp/extensions/CuMesh --recursive
-    pip install /tmp/extensions/CuMesh --no-build-isolation
+    MAX_JOBS=4 TORCH_CUDA_ARCH_LIST="8.6" pip install /tmp/extensions/CuMesh --no-build-isolation
 fi
 
 if [ "$FLEXGEMM" = true ] ; then
     mkdir -p /tmp/extensions
     git clone https://github.com/JeffreyXiang/FlexGEMM.git /tmp/extensions/FlexGEMM --recursive
-    pip install /tmp/extensions/FlexGEMM --no-build-isolation
+    MAX_JOBS=4 TORCH_CUDA_ARCH_LIST="8.6" pip install /tmp/extensions/FlexGEMM --no-build-isolation
 fi
 
 if [ "$OVOXEL" = true ] ; then
@@ -136,5 +136,5 @@ if [ "$OVOXEL" = true ] ; then
     git submodule update --init -- o-voxel/third_party/eigen
     rm -rf /tmp/extensions/o-voxel
     cp -r o-voxel /tmp/extensions/o-voxel
-    pip install /tmp/extensions/o-voxel --no-build-isolation --no-deps
+    MAX_JOBS=4 TORCH_CUDA_ARCH_LIST="8.6" pip install /tmp/extensions/o-voxel --no-build-isolation --no-deps
 fi
