@@ -7,12 +7,23 @@ exports one model + preview per condition for visual comparison.
 
 Memory model
 ------------
-Images are preprocessed once with a temporary pipeline that is then
-unloaded.  Each benchmark condition loads a fresh pipeline, runs to
-completion, saves outputs, then unloads the pipeline and flushes the
-CUDA cache before the next condition starts.  This prevents GPU memory
-fragmentation from building up across conditions and ensures every
-condition starts from a clean 24 GB state.
+Image preprocessing uses only the BiRefNet background-removal model (~885 MB
+GPU) which is loaded, used, and unloaded before any condition starts.  Each
+benchmark condition then loads the full 4B TRELLIS pipeline (~22.6 GB GPU),
+runs to completion, and fully unloads (weights deleted + CUDA cache flushed)
+before the next condition starts.  This prevents GPU memory fragmentation and
+ensures every condition starts from a clean state.
+
+Stage flow (per condition)
+--------------------------
+[load]   TRELLIS.2-4B            ~18s   ~22.6 GiB VRAM
+[1/5]    image conditioning       ~3s   cond_512, cond_1024
+[2/5]    sparse structure        ~45s   N voxels  [skipped for P2 — hull used]
+[3/5]    shape SLAT              ~92s
+[4/5]    texture SLAT            ~88s   [skipped with --skip-tex]
+[5/5]    decode + export         ~12s   model.glb / model.obj
+         preview render           ~4s   preview.png
+[unload] TRELLIS.2-4B                   VRAM freed
 
 Output layout
 -------------
@@ -23,9 +34,7 @@ Each invocation creates a timestamped run folder inside --output-dir::
         ├── baseline/
         │   ├── model.glb       (model.obj with --skip-tex)
         │   └── preview.png
-        ├── P1-mean/
-        │   ├── model.glb
-        │   └── preview.png
+        ├── P1-mean/ ...
         ├── P1-concat/ ...
         ├── P2-scaffold/ ...
         ├── P2-scaffold+P1/ ...
@@ -38,38 +47,35 @@ baseline
 
 P1-mean
     Condition fusion — joint mean of DINOv3 patch tokens from all views.
-    One stage-1 sample from the joint condition.
 
 P1-concat
     Condition fusion — DINOv3 tokens concatenated across views (V×N tokens).
-    One stage-1 sample from the joint condition.
 
 P2-scaffold
     External visual-hull bypass.  Space-carve silhouettes at assumed-orbit
-    azimuths.  Feed coords directly to stage-2.  Primary conditioning only.
+    azimuths.  Feed coords directly to stage 3 (shape SLAT).
 
 P2-scaffold+P1
-    External visual-hull bypass + joint mean conditioning for stage-2.
-    Expected to combine geometric stability with richer semantic context.
+    External visual-hull bypass + joint mean conditioning for stages 3–5.
 
 Usage examples
 --------------
-# Minimal run — all 5 conditions on 4 views at default azimuths
+# All 5 conditions on 4 views at default azimuths
 python scripts/benchmark_multiview.py \\
     front.png right.png rear.png left.png \\
     --output-dir ./out
 
-# Skip scaffold conditions
+# Skip scaffold conditions (no visual hull needed)
 python scripts/benchmark_multiview.py \\
     front.png side.png \\
     --skip-scaffold --output-dir ./out
 
-# Geometry-only (no texture SLAT — much faster, lower VRAM)
+# Geometry-only — skip texture SLAT (faster, lower VRAM)
 python scripts/benchmark_multiview.py \\
     front.png right.png rear.png left.png \\
     --skip-tex --output-dir ./out
 
-# Sparse-only (fast voxel count sweep, no model export)
+# Sparse-only — count voxels without exporting any model
 python scripts/benchmark_multiview.py \\
     front.png right.png rear.png left.png \\
     --sparse-only --output-dir ./out
@@ -79,11 +85,6 @@ python scripts/benchmark_multiview.py \\
     img1.png img2.png img3.png \\
     --azimuths 0 45 200 --elevation 20 \\
     --output-dir ./out
-
-# Faster 512-resolution pipeline for quick iteration
-python scripts/benchmark_multiview.py \\
-    front.png rear.png \\
-    --pipeline 512 --output-dir ./out
 """
 
 import argparse
@@ -92,6 +93,7 @@ import json
 import os
 import sys
 import time
+from contextlib import contextmanager
 from datetime import datetime
 from typing import Dict, List, Optional
 
@@ -114,8 +116,52 @@ from scaffold_bypass import (
     make_look_at_rotation,
     space_carve,
     occupancy_to_coords,
-    run_scaffold_bypass,
 )
+
+
+# ---------------------------------------------------------------------------
+# Logging helpers
+# ---------------------------------------------------------------------------
+
+@contextmanager
+def log_step(label: str, step: int = None, total: int = None):
+    """
+    Context manager for timed, structured stage logging.
+
+    Prints ``[step/total] label ...`` on enter and ``done in Xs`` on exit.
+    Yields a single-element list whose value is set to elapsed seconds on exit
+    so callers can record it::
+
+        with log_step("shape SLAT", 3, 5) as t:
+            ...
+        stage_times["shape_slat_s"] = round(t[0], 2)
+    """
+    prefix = f"[{step}/{total}] " if step is not None else ""
+    print(f"\n  {prefix}{label} ...", flush=True)
+    t0 = time.time()
+    elapsed = [0.0]
+    try:
+        yield elapsed
+    finally:
+        elapsed[0] = time.time() - t0
+        print(f"       └─ done in {elapsed[0]:.1f}s")
+
+
+def gpu_mem_str() -> str:
+    """Return a compact string with current GPU memory allocation."""
+    if not torch.cuda.is_available():
+        return "no CUDA"
+    alloc = torch.cuda.memory_allocated() / 1e9
+    reserved = torch.cuda.memory_reserved() / 1e9
+    return f"{alloc:.1f} GiB allocated, {reserved:.1f} GiB reserved"
+
+
+def print_banner(title: str) -> None:
+    """Print a top-level section banner."""
+    width = 64
+    print("\n" + "=" * width)
+    print(f"  {title}")
+    print("=" * width)
 
 
 # ---------------------------------------------------------------------------
@@ -140,9 +186,9 @@ def load_rembg_model(model_name: str = "briaai/RMBG-2.0"):
     """
     Load only the BiRefNet background-removal model (~885 MB GPU).
 
-    This is used for image preprocessing and silhouette extraction without
-    loading the full 4B TRELLIS pipeline (~22.6 GB), avoiding the double-load
-    that triggers the OS OOM killer.
+    Used for image preprocessing and silhouette extraction without loading the
+    full 4B TRELLIS pipeline, avoiding the back-to-back double-load that
+    triggers the OS OOM killer.
     """
     from trellis2.pipelines.rembg import BiRefNet
     model = BiRefNet(model_name=model_name)
@@ -158,12 +204,17 @@ def unload_rembg_model(model) -> None:
     torch.cuda.synchronize()
 
 
+# ---------------------------------------------------------------------------
+# Preprocessing (rembg-only, no full pipeline)
+# ---------------------------------------------------------------------------
+
 def preprocess_image_standalone(raw_img: Image.Image, rembg_model) -> Image.Image:
     """
     Replicate pipeline.preprocess_image() using only the rembg model.
 
     Returns the same premultiplied-alpha RGB image the pipeline would produce,
-    so conditioning tokens computed later will be identical.
+    so conditioning tokens computed later are identical to what the pipeline
+    would generate if it ran preprocess_image itself.
     """
     img = raw_img
     has_alpha = False
@@ -176,10 +227,7 @@ def preprocess_image_standalone(raw_img: Image.Image, rembg_model) -> Image.Imag
     if scale < 1:
         img = img.resize((int(img.width * scale), int(img.height * scale)),
                          Image.Resampling.LANCZOS)
-    if has_alpha:
-        output = img
-    else:
-        output = rembg_model(img.convert("RGB"))
+    output = img if has_alpha else rembg_model(img.convert("RGB"))
     output_np = np.array(output)
     alpha = output_np[:, :, 3]
     bbox_pts = np.argwhere(alpha > 0.8 * 255)
@@ -193,34 +241,34 @@ def preprocess_image_standalone(raw_img: Image.Image, rembg_model) -> Image.Imag
             center[0] + size // 2, center[1] + size // 2)
     output = output.crop(bbox)
     out_np = np.array(output).astype(np.float32) / 255
-    out_np = out_np[:, :, :3] * out_np[:, :, 3:4]  # premultiply alpha
+    out_np = out_np[:, :, :3] * out_np[:, :, 3:4]
     return Image.fromarray((out_np * 255).astype(np.uint8))
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+def extract_silhouette_rembg(rembg_model, raw_rgb: Image.Image) -> np.ndarray:
+    """
+    Run rembg on a raw RGB image and return a binary foreground mask.
 
-def run_timestamp() -> str:
-    """Human-readable timestamp for run folder names (no colons)."""
-    return datetime.now().strftime("%Y%m%d_%H%M%S")
-
-
-def print_section(title: str) -> None:
-    width = 64
-    print("\n" + "=" * width)
-    print(f"  {title}")
-    print("=" * width)
-
-
-def cond_folder_name(condition_name: str) -> str:
-    """Convert a condition name to a safe directory name."""
-    return condition_name.replace("+", "_plus_")
+    Must use the rembg model directly on raw images — NOT on preprocessed
+    output.  preprocess_image_standalone() premultiplies alpha into RGB and
+    drops the alpha channel; converting back to RGBA then gives alpha=255
+    everywhere, producing a 100%-dense visual hull.
+    """
+    rgba = rembg_model(raw_rgb.convert("RGB"))
+    return np.array(rgba)[:, :, 3] > 0
 
 
 # ---------------------------------------------------------------------------
 # Output helpers
 # ---------------------------------------------------------------------------
+
+def cond_folder_name(condition_name: str) -> str:
+    return condition_name.replace("+", "_plus_")
+
+
+def run_timestamp() -> str:
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
 
 def save_glb(pipeline, mesh, res: int, cond_dir: str,
              texture_size: int, decimation_target: int) -> str:
@@ -246,7 +294,7 @@ def save_glb(pipeline, mesh, res: int, cond_dir: str,
 
 
 def save_obj(mesh, cond_dir: str) -> str:
-    """Export a plain geometry-only Mesh as .obj via trimesh."""
+    """Export a geometry-only Mesh as .obj via trimesh."""
     import trimesh
     tm = trimesh.Trimesh(
         vertices=mesh.vertices.cpu().float().numpy(),
@@ -259,11 +307,10 @@ def save_obj(mesh, cond_dir: str) -> str:
 
 def save_preview(mesh, cond_dir: str, resolution: int = 512) -> Optional[str]:
     """
-    Render a 4-view snapshot of a mesh and save as preview.png.
+    Render a 4-view PBR snapshot and save as preview.png.
 
-    Works with both MeshWithVoxel (PbrMeshRenderer) and plain Mesh
-    (MeshRenderer) — render_utils.get_renderer() dispatches automatically.
-    Must be called while the pipeline is still loaded on GPU.
+    Dispatches automatically: MeshWithVoxel → PbrMeshRenderer,
+    plain Mesh → MeshRenderer.  Must be called while GPU is still loaded.
     """
     from trellis2.utils import render_utils
     try:
@@ -271,29 +318,13 @@ def save_preview(mesh, cond_dir: str, resolution: int = 512) -> Optional[str]:
             mesh, resolution=resolution, r=2, fov=36, nviews=4,
         )
         frames = snapshot.get("shaded", next(iter(snapshot.values())))
-        strip = np.concatenate(frames[:4], axis=1)  # (H, W*4, C)
+        strip = np.concatenate(frames[:4], axis=1)
         path = os.path.join(cond_dir, "preview.png")
         Image.fromarray(strip).save(path)
         return path
     except Exception as exc:
-        print(f"  [WARN] Preview rendering failed: {exc}")
+        print(f"       [WARN] preview rendering failed: {exc}")
         return None
-
-
-# ---------------------------------------------------------------------------
-# Silhouette extraction (must use rembg directly on raw RGB images)
-# ---------------------------------------------------------------------------
-
-def extract_silhouette_rembg(rembg_model, raw_rgb: Image.Image) -> np.ndarray:
-    """
-    Run rembg on a raw RGB image and return a binary foreground mask.
-
-    Takes the BiRefNet model directly (not the full pipeline) so it can be
-    used before the 4B TRELLIS model is loaded.  BiRefNet.__call__ handles
-    the cuda transfer internally.
-    """
-    rgba = rembg_model(raw_rgb.convert("RGB"))
-    return np.array(rgba)[:, :, 3] > 0
 
 
 # ---------------------------------------------------------------------------
@@ -314,176 +345,216 @@ def coords_iou(a: torch.Tensor, b: torch.Tensor, grid_size: int = 64) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Shape-only (skip-tex) helper
-# ---------------------------------------------------------------------------
-
-def _run_shape_slat(pipeline, cond_512, cond_1024, coords, pipeline_type):
-    """
-    Run shape SLAT sampling and decode without any texture stages.
-    Returns List[Mesh] (plain geometry, no PBR attributes).
-    """
-    if pipeline_type == "512":
-        slat = pipeline.sample_shape_slat(
-            cond_512, pipeline.models["shape_slat_flow_model_512"], coords)
-        res = 512
-    elif pipeline_type == "1024":
-        slat = pipeline.sample_shape_slat(
-            cond_1024, pipeline.models["shape_slat_flow_model_1024"], coords)
-        res = 1024
-    else:
-        hr_res = 1024 if pipeline_type == "1024_cascade" else 1536
-        slat, res = pipeline.sample_shape_slat_cascade(
-            cond_512, cond_1024,
-            pipeline.models["shape_slat_flow_model_512"],
-            pipeline.models["shape_slat_flow_model_1024"],
-            512, hr_res, coords,
-        )
-    torch.cuda.empty_cache()
-    meshes, _ = pipeline.decode_shape_slat(slat, res)
-    meshes[0].fill_holes()
-    return meshes, res
-
-
-# ---------------------------------------------------------------------------
-# Per-condition runners
+# Shared stage runner (stages 3–5)
 # ---------------------------------------------------------------------------
 
 _SS_RES = {"512": 32, "1024": 64, "1024_cascade": 32, "1536_cascade": 32}
 
 
-def run_baseline(pipeline, images, cond_dir, args) -> Dict:
-    ss_res = _SS_RES[args.pipeline]
-    torch.manual_seed(args.seed)
+def _run_stages(
+    pipeline,
+    cond_512: dict,
+    cond_1024: Optional[dict],
+    coords: torch.Tensor,
+    args: argparse.Namespace,
+    cond_dir: str,
+) -> Dict:
+    """
+    Run stages 3–5 for any condition type.
 
-    if args.sparse_only:
-        cond = pipeline.get_cond([images[0]], 512)
-        coords = pipeline.sample_sparse_structure(cond, ss_res)
-        return {"coords": coords, "model_path": None, "preview_path": None}
+    Stage 3: shape SLAT (always)
+    Stage 4: texture SLAT (skipped with --skip-tex)
+    Stage 5: decode + export + optional preview render
 
-    cond_512 = pipeline.get_cond([images[0]], 512)
-    cond_1024 = pipeline.get_cond([images[0]], 1024) if args.pipeline != "512" else None
-    coords = pipeline.sample_sparse_structure(cond_512, ss_res)
+    Returns {"model_path", "preview_path", "stage_times", "meshes"}.
+    Callers merge their own stage_times (conditioning, sparse structure) with
+    the returned stage_times dict.
+    """
+    stage_times: Dict = {}
 
-    model_path = None
-    preview_path = None
+    # ------------------------------------------------------------------
+    # Stage 3: Shape SLAT
+    # ------------------------------------------------------------------
+    with log_step("shape SLAT", 3, 5) as t:
+        if args.pipeline == "512":
+            shape_slat = pipeline.sample_shape_slat(
+                cond_512, pipeline.models["shape_slat_flow_model_512"], coords)
+            res = 512
+        elif args.pipeline == "1024":
+            shape_slat = pipeline.sample_shape_slat(
+                cond_1024, pipeline.models["shape_slat_flow_model_1024"], coords)
+            res = 1024
+        else:
+            hr_res = 1536 if args.pipeline == "1536_cascade" else 1024
+            shape_slat, res = pipeline.sample_shape_slat_cascade(
+                cond_512, cond_1024,
+                pipeline.models["shape_slat_flow_model_512"],
+                pipeline.models["shape_slat_flow_model_1024"],
+                512, hr_res, coords,
+            )
+    stage_times["shape_slat_s"] = round(t[0], 2)
+    torch.cuda.empty_cache()
 
+    model_path = preview_path = None
+    meshes = []
+
+    # ------------------------------------------------------------------
+    # Stage 4 + 5
+    # ------------------------------------------------------------------
     if args.skip_tex:
-        meshes, _ = _run_shape_slat(pipeline, cond_512, cond_1024, coords, args.pipeline)
-        if meshes:
+        print(f"\n  [4/5] texture SLAT ... skipped (--skip-tex)")
+        stage_times["tex_slat_s"] = None
+
+        with log_step("decode + export (geometry-only)", 5, 5) as t:
+            meshes, _ = pipeline.decode_shape_slat(shape_slat, res)
+            meshes[0].fill_holes()
             model_path = save_obj(meshes[0], cond_dir)
-            if not args.no_preview:
-                preview_path = save_preview(meshes[0], cond_dir)
+        stage_times["decode_s"] = round(t[0], 2)
+
     else:
-        meshes = pipeline.run(
-            images[0], preprocess_image=False,
-            pipeline_type=args.pipeline, seed=args.seed,
-        )
-        if meshes:
-            res = ss_res if args.pipeline == "512" else 1024
-            model_path = save_glb(pipeline, meshes[0], res, cond_dir,
-                                   args.texture_size, args.decimation_target)
-            if not args.no_preview:
-                preview_path = save_preview(meshes[0], cond_dir)
+        cond_tex = cond_1024 if cond_1024 is not None else cond_512
+        flow_tex = (pipeline.models["tex_slat_flow_model_512"]
+                    if args.pipeline == "512"
+                    else pipeline.models["tex_slat_flow_model_1024"])
+
+        with log_step("texture SLAT", 4, 5) as t:
+            tex_slat = pipeline.sample_tex_slat(cond_tex, flow_tex, shape_slat)
+        stage_times["tex_slat_s"] = round(t[0], 2)
+        torch.cuda.empty_cache()
+
+        with log_step("decode + export (textured)", 5, 5) as t:
+            meshes = pipeline.decode_latent(shape_slat, tex_slat, res)
+            model_path = save_glb(
+                pipeline, meshes[0], res, cond_dir,
+                args.texture_size, args.decimation_target,
+            )
+        stage_times["decode_s"] = round(t[0], 2)
 
     if model_path:
-        print(f"  Model   : {model_path}")
-    if preview_path:
-        print(f"  Preview : {preview_path}")
+        print(f"       → {model_path}")
 
-    return {"coords": coords, "model_path": model_path, "preview_path": preview_path}
+    # ------------------------------------------------------------------
+    # Preview render (optional)
+    # ------------------------------------------------------------------
+    stage_times["preview_s"] = None
+    if not args.no_preview and meshes:
+        with log_step("preview render") as t:
+            preview_path = save_preview(meshes[0], cond_dir)
+        stage_times["preview_s"] = round(t[0], 2)
+        if preview_path:
+            print(f"       → {preview_path}")
+
+    return {
+        "model_path": model_path,
+        "preview_path": preview_path,
+        "stage_times": stage_times,
+        "meshes": meshes,
+    }
 
 
-def run_p1(pipeline, images, fusion_mode, cond_dir, args) -> Dict:
+# ---------------------------------------------------------------------------
+# Per-condition runners (stages 1–2 only; delegate 3–5 to _run_stages)
+# ---------------------------------------------------------------------------
+
+def run_baseline(pipeline, images: List[Image.Image], cond_dir: str,
+                 args: argparse.Namespace) -> Dict:
     ss_res = _SS_RES[args.pipeline]
+    stage_times: Dict = {}
     torch.manual_seed(args.seed)
 
+    # Stage 1: image conditioning
+    with log_step("image conditioning (single image)", 1, 5) as t:
+        cond_512 = pipeline.get_cond([images[0]], 512)
+        cond_1024 = (pipeline.get_cond([images[0]], 1024)
+                     if args.pipeline != "512" else None)
+    stage_times["conditioning_s"] = round(t[0], 2)
+
+    # Stage 2: sparse structure
+    with log_step("sparse structure", 2, 5) as t:
+        coords = pipeline.sample_sparse_structure(cond_512, ss_res)
+    stage_times["sparse_structure_s"] = round(t[0], 2)
+    print(f"       {coords.shape[0]:,} voxels")
+
     if args.sparse_only:
-        cond = pipeline.get_cond_multi(images, 512, fusion_mode)
-        coords = pipeline.sample_sparse_structure(cond, ss_res)
-        return {"coords": coords, "model_path": None, "preview_path": None}
+        stage_times.update({"shape_slat_s": None, "tex_slat_s": None,
+                            "decode_s": None, "preview_s": None})
+        return {"coords": coords, "model_path": None, "preview_path": None,
+                "stage_times": stage_times}
 
-    cond_512 = pipeline.get_cond_multi(images, 512, fusion_mode)
-    cond_1024 = (pipeline.get_cond_multi(images, 1024, fusion_mode)
-                 if args.pipeline != "512" else None)
-    coords = pipeline.sample_sparse_structure(cond_512, ss_res)
-
-    model_path = None
-    preview_path = None
-
-    if args.skip_tex:
-        meshes, _ = _run_shape_slat(pipeline, cond_512, cond_1024, coords, args.pipeline)
-        if meshes:
-            model_path = save_obj(meshes[0], cond_dir)
-            if not args.no_preview:
-                preview_path = save_preview(meshes[0], cond_dir)
-    else:
-        meshes = pipeline.run_multi_image_cond(
-            images, cond_fusion_mode=fusion_mode,
-            preprocess_image=False, pipeline_type=args.pipeline, seed=args.seed,
-        )
-        if meshes:
-            res = ss_res if args.pipeline == "512" else 1024
-            model_path = save_glb(pipeline, meshes[0], res, cond_dir,
-                                   args.texture_size, args.decimation_target)
-            if not args.no_preview:
-                preview_path = save_preview(meshes[0], cond_dir)
-
-    if model_path:
-        print(f"  Model   : {model_path}")
-    if preview_path:
-        print(f"  Preview : {preview_path}")
-
-    return {"coords": coords, "model_path": model_path, "preview_path": preview_path}
+    # Stages 3–5
+    out = _run_stages(pipeline, cond_512, cond_1024, coords, args, cond_dir)
+    out["stage_times"] = {**stage_times, **out["stage_times"]}
+    out["coords"] = coords
+    return out
 
 
-def run_p2(pipeline, images, occupancy, cond_fusion_mode, cond_dir, args) -> Dict:
+def run_p1(pipeline, images: List[Image.Image], fusion_mode: str,
+           cond_dir: str, args: argparse.Namespace) -> Dict:
     ss_res = _SS_RES[args.pipeline]
+    stage_times: Dict = {}
+    torch.manual_seed(args.seed)
+
+    # Stage 1: multi-view condition fusion
+    with log_step(f"image conditioning (multi/{fusion_mode})", 1, 5) as t:
+        cond_512 = pipeline.get_cond_multi(images, 512, fusion_mode)
+        cond_1024 = (pipeline.get_cond_multi(images, 1024, fusion_mode)
+                     if args.pipeline != "512" else None)
+    stage_times["conditioning_s"] = round(t[0], 2)
+
+    # Stage 2: sparse structure
+    with log_step("sparse structure", 2, 5) as t:
+        coords = pipeline.sample_sparse_structure(cond_512, ss_res)
+    stage_times["sparse_structure_s"] = round(t[0], 2)
+    print(f"       {coords.shape[0]:,} voxels")
+
+    if args.sparse_only:
+        stage_times.update({"shape_slat_s": None, "tex_slat_s": None,
+                            "decode_s": None, "preview_s": None})
+        return {"coords": coords, "model_path": None, "preview_path": None,
+                "stage_times": stage_times}
+
+    # Stages 3–5
+    out = _run_stages(pipeline, cond_512, cond_1024, coords, args, cond_dir)
+    out["stage_times"] = {**stage_times, **out["stage_times"]}
+    out["coords"] = coords
+    return out
+
+
+def run_p2(pipeline, images: List[Image.Image], occupancy: np.ndarray,
+           cond_fusion_mode: str, cond_dir: str,
+           args: argparse.Namespace) -> Dict:
+    stage_times: Dict = {}
+    torch.manual_seed(args.seed)
+
+    # Stage 2 is skipped — coords come from the visual hull
     coords = occupancy_to_coords(occupancy, device=pipeline.device)
+    print(f"\n  [2/5] sparse structure ... skipped (hull: {coords.shape[0]:,} voxels)")
+    stage_times["sparse_structure_s"] = None
 
     if args.sparse_only:
-        return {"coords": coords, "model_path": None, "preview_path": None}
+        stage_times.update({"conditioning_s": None, "shape_slat_s": None,
+                            "tex_slat_s": None, "decode_s": None, "preview_s": None})
+        return {"coords": coords, "model_path": None, "preview_path": None,
+                "stage_times": stage_times}
 
-    model_path = None
-    preview_path = None
+    # Stage 1: conditioning (needed for stages 3–5 even in P2)
+    primary = images[0]
+    with log_step(f"image conditioning ({cond_fusion_mode})", 1, 5) as t:
+        if cond_fusion_mode == "mean":
+            cond_512 = pipeline.get_cond_multi(images, 512, "mean")
+            cond_1024 = (pipeline.get_cond_multi(images, 1024, "mean")
+                         if args.pipeline != "512" else None)
+        else:
+            cond_512 = pipeline.get_cond([primary], 512)
+            cond_1024 = (pipeline.get_cond([primary], 1024)
+                         if args.pipeline != "512" else None)
+    stage_times["conditioning_s"] = round(t[0], 2)
 
-    if args.skip_tex:
-        # Bypass run_scaffold_bypass and call stages directly to skip texture.
-        primary_img = images[0]
-        cond_512 = (pipeline.get_cond_multi(images, 512, "mean")
-                    if cond_fusion_mode == "mean"
-                    else pipeline.get_cond([primary_img], 512))
-        cond_1024 = (pipeline.get_cond_multi(images, 1024, "mean")
-                     if cond_fusion_mode == "mean" and args.pipeline != "512"
-                     else (pipeline.get_cond([primary_img], 1024)
-                           if args.pipeline != "512" else None))
-        meshes, _ = _run_shape_slat(pipeline, cond_512, cond_1024, coords, args.pipeline)
-        if meshes:
-            model_path = save_obj(meshes[0], cond_dir)
-            if not args.no_preview:
-                preview_path = save_preview(meshes[0], cond_dir)
-    else:
-        result = run_scaffold_bypass(
-            pipeline=pipeline,
-            occupancy=occupancy,
-            conditioning_images=images,
-            cond_fusion_mode=cond_fusion_mode,
-            pipeline_type=args.pipeline,
-            seed=args.seed,
-        )
-        coords = result["coords"]
-        if result["meshes"]:
-            res = ss_res if args.pipeline == "512" else 1024
-            model_path = save_glb(pipeline, result["meshes"][0], res, cond_dir,
-                                   args.texture_size, args.decimation_target)
-            if not args.no_preview:
-                preview_path = save_preview(result["meshes"][0], cond_dir)
-
-    if model_path:
-        print(f"  Model   : {model_path}")
-    if preview_path:
-        print(f"  Preview : {preview_path}")
-
-    return {"coords": coords, "model_path": model_path, "preview_path": preview_path}
+    # Stages 3–5
+    out = _run_stages(pipeline, cond_512, cond_1024, coords, args, cond_dir)
+    out["stage_times"] = {**stage_times, **out["stage_times"]}
+    out["coords"] = coords
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -498,20 +569,20 @@ def run_condition(
     run_dir: str,
 ) -> Dict:
     """
-    Load a fresh pipeline, run one condition, save outputs, unload the
-    pipeline, and return a result dict.
+    Load the 4B pipeline, run one condition through all explicit stages,
+    save outputs, unload the pipeline, and return a result dict.
 
-    The pipeline is fully unloaded (weights deleted, CUDA cache flushed)
-    before this function returns so the next condition starts from a clean
-    GPU state.
+    The pipeline is fully unloaded before this function returns so the next
+    condition starts from a clean GPU state.
     """
-    result = {
+    result: Dict = {
         "name": name,
         "coords": None,
         "voxels": 0,
         "elapsed_s": 0.0,
         "model_path": None,
         "preview_path": None,
+        "stage_times": {},
         "error": None,
     }
     t0 = time.time()
@@ -521,8 +592,10 @@ def run_condition(
     os.makedirs(cond_dir, exist_ok=True)
 
     try:
-        print(f"  Loading pipeline for {name} ...")
-        pipeline = load_pipeline(args.model)
+        with log_step(f"[LOAD] {args.model}") as t:
+            pipeline = load_pipeline(args.model)
+        print(f"       {gpu_mem_str()}")
+        result["stage_times"]["load_s"] = round(t[0], 2)
 
         if name == "baseline":
             out = run_baseline(pipeline, images, cond_dir, args)
@@ -532,28 +605,34 @@ def run_condition(
             out = run_p1(pipeline, images, "concat", cond_dir, args)
         elif name == "P2-scaffold":
             if occupancy is None:
-                raise RuntimeError("No scaffold — pass --skip-scaffold to omit P2 conditions.")
+                raise RuntimeError(
+                    "No scaffold — pass --skip-scaffold to omit P2 conditions.")
             out = run_p2(pipeline, images, occupancy, "primary", cond_dir, args)
         elif name == "P2-scaffold+P1":
             if occupancy is None:
-                raise RuntimeError("No scaffold — pass --skip-scaffold to omit P2 conditions.")
+                raise RuntimeError(
+                    "No scaffold — pass --skip-scaffold to omit P2 conditions.")
             out = run_p2(pipeline, images, occupancy, "mean", cond_dir, args)
         else:
             raise ValueError(f"Unknown condition: {name!r}")
 
         result["coords"] = out["coords"]
-        result["voxels"] = int(out["coords"].shape[0]) if out["coords"] is not None else 0
+        result["voxels"] = (int(out["coords"].shape[0])
+                            if out["coords"] is not None else 0)
         result["model_path"] = out["model_path"]
         result["preview_path"] = out["preview_path"]
+        result["stage_times"].update(out.get("stage_times", {}))
 
     except Exception as exc:
         result["error"] = str(exc)
-        print(f"  [ERROR] {exc}")
+        print(f"\n  [ERROR] {exc}")
 
     finally:
         if pipeline is not None:
-            print(f"  Unloading pipeline ...")
-            unload_pipeline(pipeline)
+            with log_step(f"[UNLOAD] {args.model}") as t:
+                unload_pipeline(pipeline)
+            print(f"       GPU memory cleared")
+            result["stage_times"]["unload_s"] = round(t[0], 2)
 
     result["elapsed_s"] = time.time() - t0
     return result
@@ -563,25 +642,50 @@ def run_condition(
 # Reporting
 # ---------------------------------------------------------------------------
 
-def print_summary(results: List[Dict], baseline_coords: Optional[torch.Tensor]) -> None:
-    print_section("Benchmark Summary")
+def _fmt_stage_times(st: Dict) -> str:
+    """Format stage_times dict as a compact one-liner for print_summary."""
+    keys = [
+        ("load_s",             "load"),
+        ("conditioning_s",     "cond"),
+        ("sparse_structure_s", "sparse"),
+        ("shape_slat_s",       "shape"),
+        ("tex_slat_s",         "tex"),
+        ("decode_s",           "decode"),
+        ("preview_s",          "preview"),
+    ]
+    parts = []
+    for k, label in keys:
+        v = st.get(k)
+        if v is not None:
+            parts.append(f"{label}={v:.1f}s")
+        elif k in st:
+            parts.append(f"{label}=skip")
+    return "  " + "  ".join(parts) if parts else ""
+
+
+def print_summary(results: List[Dict],
+                  baseline_coords: Optional[torch.Tensor]) -> None:
+    print_banner("Benchmark Summary")
     hdr = f"{'Condition':<22} {'Voxels':>8} {'Elapsed':>9}  {'IoU vs base':>12}  Status"
     print(hdr)
     print("-" * len(hdr))
     for r in results:
         iou_str = "—"
-        if r["coords"] is not None and baseline_coords is not None and r["name"] != "baseline":
+        if (r["coords"] is not None and baseline_coords is not None
+                and r["name"] != "baseline"):
             iou = coords_iou(r["coords"], baseline_coords)
             iou_str = f"{iou:.3f}"
         status = "ERROR" if r["error"] else ("model" if r["model_path"] else "sparse-only")
         print(f"{r['name']:<22} {r['voxels']:>8} {r['elapsed_s']:>8.1f}s  "
               f"{iou_str:>12}  {status}")
+        if r["stage_times"]:
+            print(_fmt_stage_times(r["stage_times"]))
         if r["model_path"]:
-            print(f"    model   → {r['model_path']}")
+            print(f"  model   → {r['model_path']}")
         if r["preview_path"]:
-            print(f"    preview → {r['preview_path']}")
+            print(f"  preview → {r['preview_path']}")
         if r["error"]:
-            print(f"    error   : {r['error']}")
+            print(f"  error   : {r['error']}")
     print()
 
 
@@ -591,19 +695,6 @@ def save_json_summary(
     run_meta: dict,
     baseline_coords: Optional[torch.Tensor],
 ) -> str:
-    """
-    Write a self-contained summary.json with full run parameters and
-    per-condition metrics.  Structure::
-
-        {
-          "run": { ...parameters, scaffold stats, timing... },
-          "conditions": [
-            { "name", "status", "voxels", "iou_vs_baseline",
-              "elapsed_s", "model_path", "preview_path", "error" },
-            ...
-          ]
-        }
-    """
     condition_rows = []
     for r in results:
         iou = None
@@ -617,15 +708,13 @@ def save_json_summary(
             "voxels": r["voxels"],
             "iou_vs_baseline": iou,
             "elapsed_s": round(r["elapsed_s"], 2),
+            "stage_times": r.get("stage_times", {}),
             "model_path": r["model_path"],
             "preview_path": r["preview_path"],
             "error": r["error"],
         })
 
-    doc = {
-        "run": run_meta,
-        "conditions": condition_rows,
-    }
+    doc = {"run": run_meta, "conditions": condition_rows}
     path = os.path.join(run_dir, "summary.json")
     with open(path, "w") as f:
         json.dump(doc, f, indent=2)
@@ -646,23 +735,24 @@ def parse_args() -> argparse.Namespace:
                    help="Input image paths, one per viewpoint (first = front).")
     p.add_argument("--output-dir", default="./out")
     p.add_argument("--azimuths", nargs="+", type=float, default=None,
-                   help="Camera azimuth per image in degrees (default: evenly spaced 360°).")
+                   help="Camera azimuth per image in degrees "
+                        "(default: evenly spaced 360°).")
     p.add_argument("--elevation", type=float, default=15.0)
     p.add_argument("--skip-scaffold", action="store_true",
                    help="Skip P2-scaffold and P2-scaffold+P1.")
     p.add_argument("--sparse-only", action="store_true",
-                   help="Skip all model export; only count voxels.")
+                   help="Stop after stage 2; count voxels only, no model export.")
     p.add_argument("--skip-tex", action="store_true",
-                   help="Skip texture SLAT stages; output geometry-only .obj. "
-                        "Saves significant GPU time and VRAM.")
+                   help="Skip stage 4 (texture SLAT); output geometry-only .obj.")
     p.add_argument("--no-preview", action="store_true",
-                   help="Skip rendering preview PNGs.")
+                   help="Skip preview PNG rendering.")
     p.add_argument("--pipeline", default="1024_cascade",
                    choices=["512", "1024", "1024_cascade", "1536_cascade"])
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--model", default="microsoft/TRELLIS.2-4B")
     p.add_argument("--rembg-model", default="briaai/RMBG-2.0",
-                   help="HuggingFace model ID for background removal (default: briaai/RMBG-2.0).")
+                   help="HuggingFace model ID for background removal "
+                        "(default: briaai/RMBG-2.0).")
     p.add_argument("--texture-size", type=int, default=1024)
     p.add_argument("--decimation-target", type=int, default=500_000)
     p.add_argument("--min-views-scaffold", type=int, default=None,
@@ -672,9 +762,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--conditions", nargs="+",
                    choices=["baseline", "P1-mean", "P1-concat",
                             "P2-scaffold", "P2-scaffold+P1"],
-                   default=None)
+                   default=None,
+                   help="Run only specific conditions (default: all).")
     return p.parse_args()
 
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main() -> None:
     args = parse_args()
@@ -688,78 +783,85 @@ def main() -> None:
     else:
         conditions = all_conditions
 
-    print_section("TRELLIS.2 Multi-View Benchmark")
-    print(f"  Images    : {args.images}")
-    print(f"  Conditions: {conditions}")
-    print(f"  Pipeline  : {args.pipeline}")
-    print(f"  Skip-tex  : {args.skip_tex}")
-    print(f"  Seed      : {args.seed}")
-    print(f"  Output    : {args.output_dir}")
+    print_banner("TRELLIS.2 Multi-View Benchmark")
+    print(f"  Model      : {args.model}")
+    print(f"  Pipeline   : {args.pipeline}")
+    print(f"  Images     : {args.images}")
+    print(f"  Conditions : {conditions}")
+    print(f"  Seed       : {args.seed}")
+    print(f"  Skip-tex   : {args.skip_tex}")
+    print(f"  Output     : {args.output_dir}")
 
     # -----------------------------------------------------------------------
-    # Step 1: preprocess images using only the BiRefNet rembg model (~885 MB).
+    # Phase 1: Image preprocessing (BiRefNet only, ~885 MB GPU)
     #
-    # The full 4B pipeline (~22.6 GB) is NOT loaded here.  Loading it twice
-    # in sequence (once for preprocessing, once per condition) exhausts system
-    # RAM and triggers the OS OOM killer before any condition starts.
-    #
-    # Silhouettes for space carving are also extracted here from the raw RGB
-    # images (NOT from the preprocessed output, which premultiplies alpha into
-    # RGB and drops the alpha channel → all-255 alpha → 100% scaffold density).
+    # The full 4B model is NOT loaded here.  BiRefNet is loaded, used, and
+    # fully unloaded before any condition pipeline is loaded, so GPU memory
+    # is clean when the first condition starts.
     # -----------------------------------------------------------------------
-    print_section("Preprocessing images")
-    t0 = time.time()
-    print(f"  Loading BiRefNet ({args.rembg_model}) ...")
-    rembg_model = load_rembg_model(args.rembg_model)
+    print_banner("Phase 1 — Preprocessing")
+
+    with log_step(f"[LOAD] BiRefNet ({args.rembg_model})") as t:
+        rembg_model = load_rembg_model(args.rembg_model)
+    print(f"       {gpu_mem_str()}")
 
     n = len(args.images)
     raw_images = [Image.open(p).convert("RGB") for p in args.images]
-    images = [preprocess_image_standalone(img, rembg_model) for img in raw_images]
-    print(f"  Preprocessed {n} image(s) in {time.time() - t0:.1f}s")
+
+    with log_step(f"preprocess {n} image(s)") as t:
+        images = [preprocess_image_standalone(img, rembg_model)
+                  for img in raw_images]
+    preprocess_elapsed = round(t[0], 2)
+    print(f"       {n} image(s) ready")
 
     if args.azimuths is not None:
         if len(args.azimuths) != n:
             raise ValueError(
-                f"--azimuths has {len(args.azimuths)} values but {n} images provided."
-            )
+                f"--azimuths has {len(args.azimuths)} values but {n} images provided.")
         azimuths = list(args.azimuths)
     else:
         azimuths = [360.0 * i / n for i in range(n)]
-        print(f"  Auto azimuths: {[f'{a:.1f}°' for a in azimuths]}")
+        print(f"       auto azimuths: {[f'{a:.1f}°' for a in azimuths]}")
 
+    # -----------------------------------------------------------------------
+    # Phase 1b: Visual hull scaffold (still with BiRefNet loaded)
+    # -----------------------------------------------------------------------
     occupancy = None
     scaffold_info: dict = {}
+
     if not args.skip_scaffold and any(
         c in conditions for c in ("P2-scaffold", "P2-scaffold+P1")
     ):
-        print_section("Building visual-hull scaffold")
-        scaffold_masks = [
-            extract_silhouette_rembg(rembg_model, raw_img) for raw_img in raw_images
-        ]
+        print_banner("Phase 1b — Visual Hull Scaffold")
+        with log_step("extract silhouettes") as t:
+            scaffold_masks = [
+                extract_silhouette_rembg(rembg_model, raw_img)
+                for raw_img in raw_images
+            ]
+        for i, m in enumerate(scaffold_masks):
+            print(f"       view {i}: {m.sum():,} foreground px "
+                  f"({100 * m.mean():.1f}% of frame)")
+
         scaffold_rotations = [
             make_look_at_rotation(az, args.elevation) for az in azimuths
         ]
-        for i, m in enumerate(scaffold_masks):
-            print(f"  View {i}: {m.sum():,} foreground pixels "
-                  f"({100 * m.mean():.1f}% of frame)")
-
         ss_res = {"512": 32, "1024": 64,
                   "1024_cascade": 32, "1536_cascade": 32}[args.pipeline]
         min_views = (args.min_views_scaffold
                      if args.min_views_scaffold is not None
                      else len(scaffold_masks))
-        occupancy = space_carve(
-            scaffold_masks, scaffold_rotations,
-            grid_size=ss_res, min_views=min_views,
-        )
+
+        with log_step(f"space carve (grid={ss_res}³, min_views={min_views})") as t:
+            occupancy = space_carve(
+                scaffold_masks, scaffold_rotations,
+                grid_size=ss_res, min_views=min_views,
+            )
         n_occ = int(occupancy.sum())
         density = 100 * n_occ / occupancy.size
-        print(f"  Scaffold: {n_occ:,} / {occupancy.size:,} voxels "
-              f"({density:.1f}% density, min_views={min_views})")
+        print(f"       {n_occ:,} / {occupancy.size:,} voxels  ({density:.1f}% density)")
         if density > 80:
-            print("  WARNING: scaffold density >80% — the visual hull is nearly "
-                  "full. Check that azimuths match actual camera positions. "
-                  "Try --min-views-scaffold with a lower value if using >4 views.")
+            print("       [WARN] density >80% — hull may be nearly full. "
+                  "Check azimuths or try --min-views-scaffold with a lower value.")
         scaffold_info = {
             "grid_size": ss_res,
             "min_views": min_views,
@@ -768,25 +870,26 @@ def main() -> None:
             "density_pct": round(density, 2),
         }
 
-    print_section("Unloading BiRefNet")
-    unload_rembg_model(rembg_model)
-    print("  GPU memory cleared.")
+    with log_step(f"[UNLOAD] BiRefNet") as t:
+        unload_rembg_model(rembg_model)
+    print(f"       GPU memory cleared")
 
     # -----------------------------------------------------------------------
-    # Step 2: create the run folder, then run each condition with its own
-    # fresh pipeline.
+    # Phase 2: Run each condition
     # -----------------------------------------------------------------------
+    print_banner("Phase 2 — Benchmark Conditions")
+
     run_ts = run_timestamp()
     run_dir = os.path.join(args.output_dir, f"run_{run_ts}")
     os.makedirs(run_dir, exist_ok=True)
-    print(f"\n  Run dir: {run_dir}")
+    print(f"  Run dir: {run_dir}\n")
 
     wall_t0 = time.time()
     results = []
     baseline_coords = None
 
     for cond_name in conditions:
-        print_section(f"Condition: {cond_name}")
+        print_banner(f"Condition: {cond_name}")
         r = run_condition(
             name=cond_name,
             images=images,
@@ -795,50 +898,47 @@ def main() -> None:
             run_dir=run_dir,
         )
         results.append(r)
-        print(f"  Voxels : {r['voxels']:,}")
-        print(f"  Time   : {r['elapsed_s']:.1f}s")
+        print(f"\n  Voxels  : {r['voxels']:,}")
+        print(f"  Total   : {r['elapsed_s']:.1f}s")
         if r["error"]:
-            print(f"  Error  : {r['error']}")
+            print(f"  Error   : {r['error']}")
         if cond_name == "baseline" and r["coords"] is not None:
             baseline_coords = r["coords"].cpu()
 
     total_elapsed = round(time.time() - wall_t0, 2)
 
     # -----------------------------------------------------------------------
-    # Step 3: build run metadata and write summary.
+    # Phase 3: Summary
     # -----------------------------------------------------------------------
+    print_summary(results, baseline_coords)
+
     run_meta = {
         "run_id": run_ts,
         "run_dir": os.path.abspath(run_dir),
         "started_at": datetime.now().isoformat(timespec="seconds"),
         "total_elapsed_s": total_elapsed,
-        # --- inputs ---
+        "preprocess_elapsed_s": preprocess_elapsed,
         "images": [os.path.abspath(p) for p in args.images],
         "azimuths_deg": azimuths,
         "elevation_deg": args.elevation,
-        # --- pipeline config ---
         "model": args.model,
+        "rembg_model": args.rembg_model,
         "pipeline_type": args.pipeline,
         "seed": args.seed,
-        # --- flags ---
         "skip_tex": args.skip_tex,
         "skip_scaffold": args.skip_scaffold,
         "sparse_only": args.sparse_only,
         "no_preview": args.no_preview,
-        # --- export config ---
         "texture_size": args.texture_size,
         "decimation_target": args.decimation_target,
-        # --- conditions ---
         "conditions_run": conditions,
-        # --- scaffold (only present when P2 conditions were run) ---
         "scaffold": scaffold_info if scaffold_info else None,
     }
 
-    print_summary(results, baseline_coords)
     json_path = save_json_summary(results, run_dir, run_meta, baseline_coords)
     print(f"Summary JSON : {json_path}")
     print(f"Run folder   : {run_dir}")
-    print_section("Done")
+    print_banner("Done")
 
 
 if __name__ == "__main__":
