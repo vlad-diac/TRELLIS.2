@@ -1,0 +1,37 @@
+[
+  {
+    "name": "baseline",
+    "voxels": 1161,
+    "elapsed_s": 206.24,
+    "glb_path": "./out/benchmark/baseline_2026-05-06T151314.169.glb",
+    "error": null
+  },
+  {
+    "name": "P1-mean",
+    "voxels": 1456,
+    "elapsed_s": 202.11,
+    "glb_path": "./out/benchmark/P1-mean_2026-05-06T151635.906.glb",
+    "error": null
+  },
+  {
+    "name": "P1-concat",
+    "voxels": 1401,
+    "elapsed_s": 304.52,
+    "glb_path": "./out/benchmark/P1-concat_2026-05-06T152006.725.glb",
+    "error": null
+  },
+  {
+    "name": "P2-scaffold",
+    "voxels": 0,
+    "elapsed_s": 221.0,
+    "glb_path": null,
+    "error": "CUDA out of memory. Tried to allocate 778.00 MiB. GPU 0 has a total capacity of 23.57 GiB of which 463.06 MiB is free. Including non-PyTorch memory, this process has 23.11 GiB memory in use. Of the allocated memory 22.62 GiB is allocated by PyTorch, and 126.76 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)"
+  },
+  {
+    "name": "P2-scaffold+P1",
+    "voxels": 0,
+    "elapsed_s": 222.62,
+    "glb_path": null,
+    "error": "CUDA out of memory. Tried to allocate 414.00 MiB. GPU 0 has a total capacity of 23.57 GiB of which 145.06 MiB is free. Including non-PyTorch memory, this process has 23.42 GiB memory in use. Of the allocated memory 22.97 GiB is allocated by PyTorch, and 89.71 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)"
+  }
+]
