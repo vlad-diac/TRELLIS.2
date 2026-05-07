@@ -529,21 +529,50 @@ def print_summary(results: List[Dict], baseline_coords: Optional[torch.Tensor]) 
     print()
 
 
-def save_json_summary(results: List[Dict], run_dir: str) -> str:
-    rows = [
+def save_json_summary(
+    results: List[Dict],
+    run_dir: str,
+    run_meta: dict,
+    baseline_coords: Optional[torch.Tensor],
+) -> str:
+    """
+    Write a self-contained summary.json with full run parameters and
+    per-condition metrics.  Structure::
+
         {
+          "run": { ...parameters, scaffold stats, timing... },
+          "conditions": [
+            { "name", "status", "voxels", "iou_vs_baseline",
+              "elapsed_s", "model_path", "preview_path", "error" },
+            ...
+          ]
+        }
+    """
+    condition_rows = []
+    for r in results:
+        iou = None
+        if (r["coords"] is not None and baseline_coords is not None
+                and r["name"] != "baseline"):
+            iou = round(coords_iou(r["coords"], baseline_coords), 4)
+        status = "error" if r["error"] else ("ok" if r["model_path"] else "sparse-only")
+        condition_rows.append({
             "name": r["name"],
+            "status": status,
             "voxels": r["voxels"],
+            "iou_vs_baseline": iou,
             "elapsed_s": round(r["elapsed_s"], 2),
             "model_path": r["model_path"],
             "preview_path": r["preview_path"],
             "error": r["error"],
-        }
-        for r in results
-    ]
+        })
+
+    doc = {
+        "run": run_meta,
+        "conditions": condition_rows,
+    }
     path = os.path.join(run_dir, "summary.json")
     with open(path, "w") as f:
-        json.dump(rows, f, indent=2)
+        json.dump(doc, f, indent=2)
     return path
 
 
@@ -638,6 +667,7 @@ def main() -> None:
         print(f"  Auto azimuths: {[f'{a:.1f}°' for a in azimuths]}")
 
     occupancy = None
+    scaffold_info: dict = {}
     if not args.skip_scaffold and any(
         c in conditions for c in ("P2-scaffold", "P2-scaffold+P1")
     ):
@@ -669,6 +699,13 @@ def main() -> None:
             print("  WARNING: scaffold density >80% — the visual hull is nearly "
                   "full. Check that azimuths match actual camera positions. "
                   "Try --min-views-scaffold with a lower value if using >4 views.")
+        scaffold_info = {
+            "grid_size": ss_res,
+            "min_views": min_views,
+            "occupied_voxels": n_occ,
+            "total_voxels": int(occupancy.size),
+            "density_pct": round(density, 2),
+        }
 
     print_section("Unloading temp pipeline")
     unload_pipeline(tmp_pipeline)
@@ -683,6 +720,7 @@ def main() -> None:
     os.makedirs(run_dir, exist_ok=True)
     print(f"\n  Run dir: {run_dir}")
 
+    wall_t0 = time.time()
     results = []
     baseline_coords = None
 
@@ -703,11 +741,40 @@ def main() -> None:
         if cond_name == "baseline" and r["coords"] is not None:
             baseline_coords = r["coords"].cpu()
 
+    total_elapsed = round(time.time() - wall_t0, 2)
+
     # -----------------------------------------------------------------------
-    # Step 3: summary.
+    # Step 3: build run metadata and write summary.
     # -----------------------------------------------------------------------
+    run_meta = {
+        "run_id": run_ts,
+        "run_dir": os.path.abspath(run_dir),
+        "started_at": datetime.now().isoformat(timespec="seconds"),
+        "total_elapsed_s": total_elapsed,
+        # --- inputs ---
+        "images": [os.path.abspath(p) for p in args.images],
+        "azimuths_deg": azimuths,
+        "elevation_deg": args.elevation,
+        # --- pipeline config ---
+        "model": args.model,
+        "pipeline_type": args.pipeline,
+        "seed": args.seed,
+        # --- flags ---
+        "skip_tex": args.skip_tex,
+        "skip_scaffold": args.skip_scaffold,
+        "sparse_only": args.sparse_only,
+        "no_preview": args.no_preview,
+        # --- export config ---
+        "texture_size": args.texture_size,
+        "decimation_target": args.decimation_target,
+        # --- conditions ---
+        "conditions_run": conditions,
+        # --- scaffold (only present when P2 conditions were run) ---
+        "scaffold": scaffold_info if scaffold_info else None,
+    }
+
     print_summary(results, baseline_coords)
-    json_path = save_json_summary(results, run_dir)
+    json_path = save_json_summary(results, run_dir, run_meta, baseline_coords)
     print(f"Summary JSON : {json_path}")
     print(f"Run folder   : {run_dir}")
     print_section("Done")
