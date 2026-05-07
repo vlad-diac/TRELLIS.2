@@ -136,6 +136,67 @@ def unload_pipeline(pipeline) -> None:
     torch.cuda.synchronize()
 
 
+def load_rembg_model(model_name: str = "briaai/RMBG-2.0"):
+    """
+    Load only the BiRefNet background-removal model (~885 MB GPU).
+
+    This is used for image preprocessing and silhouette extraction without
+    loading the full 4B TRELLIS pipeline (~22.6 GB), avoiding the double-load
+    that triggers the OS OOM killer.
+    """
+    from trellis2.pipelines.rembg import BiRefNet
+    model = BiRefNet(model_name=model_name)
+    model.cuda()
+    return model
+
+
+def unload_rembg_model(model) -> None:
+    """Delete the rembg model and flush GPU memory."""
+    del model
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+
+
+def preprocess_image_standalone(raw_img: Image.Image, rembg_model) -> Image.Image:
+    """
+    Replicate pipeline.preprocess_image() using only the rembg model.
+
+    Returns the same premultiplied-alpha RGB image the pipeline would produce,
+    so conditioning tokens computed later will be identical.
+    """
+    img = raw_img
+    has_alpha = False
+    if img.mode == "RGBA":
+        alpha_ch = np.array(img)[:, :, 3]
+        if not np.all(alpha_ch == 255):
+            has_alpha = True
+    max_size = max(img.size)
+    scale = min(1, 1024 / max_size)
+    if scale < 1:
+        img = img.resize((int(img.width * scale), int(img.height * scale)),
+                         Image.Resampling.LANCZOS)
+    if has_alpha:
+        output = img
+    else:
+        output = rembg_model(img.convert("RGB"))
+    output_np = np.array(output)
+    alpha = output_np[:, :, 3]
+    bbox_pts = np.argwhere(alpha > 0.8 * 255)
+    if len(bbox_pts) == 0:
+        return img.convert("RGB")
+    bbox = (int(np.min(bbox_pts[:, 1])), int(np.min(bbox_pts[:, 0])),
+            int(np.max(bbox_pts[:, 1])), int(np.max(bbox_pts[:, 0])))
+    center = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
+    size = int(max(bbox[2] - bbox[0], bbox[3] - bbox[1]))
+    bbox = (center[0] - size // 2, center[1] - size // 2,
+            center[0] + size // 2, center[1] + size // 2)
+    output = output.crop(bbox)
+    out_np = np.array(output).astype(np.float32) / 255
+    out_np = out_np[:, :, :3] * out_np[:, :, 3:4]  # premultiply alpha
+    return Image.fromarray((out_np * 255).astype(np.uint8))
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -223,20 +284,15 @@ def save_preview(mesh, cond_dir: str, resolution: int = 512) -> Optional[str]:
 # Silhouette extraction (must use rembg directly on raw RGB images)
 # ---------------------------------------------------------------------------
 
-def extract_silhouette_rembg(pipeline, raw_rgb: Image.Image) -> np.ndarray:
+def extract_silhouette_rembg(rembg_model, raw_rgb: Image.Image) -> np.ndarray:
     """
     Run rembg on a raw RGB image and return a binary foreground mask.
 
-    preprocess_image() must NOT be used here: it premultiplies alpha into
-    the RGB channels and returns a 3-channel image, so converting back to
-    RGBA gives alpha=255 everywhere (all foreground → full-cube scaffold).
+    Takes the BiRefNet model directly (not the full pipeline) so it can be
+    used before the 4B TRELLIS model is loaded.  BiRefNet.__call__ handles
+    the cuda transfer internally.
     """
-    rgb = raw_rgb.convert("RGB")
-    if getattr(pipeline, "low_vram", False):
-        pipeline.rembg_model.to(pipeline.device)
-    rgba = pipeline.rembg_model(rgb)
-    if getattr(pipeline, "low_vram", False):
-        pipeline.rembg_model.cpu()
+    rgba = rembg_model(raw_rgb.convert("RGB"))
     return np.array(rgba)[:, :, 3] > 0
 
 
@@ -605,6 +661,8 @@ def parse_args() -> argparse.Namespace:
                    choices=["512", "1024", "1024_cascade", "1536_cascade"])
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--model", default="microsoft/TRELLIS.2-4B")
+    p.add_argument("--rembg-model", default="briaai/RMBG-2.0",
+                   help="HuggingFace model ID for background removal (default: briaai/RMBG-2.0).")
     p.add_argument("--texture-size", type=int, default=1024)
     p.add_argument("--decimation-target", type=int, default=500_000)
     p.add_argument("--min-views-scaffold", type=int, default=None,
@@ -639,21 +697,24 @@ def main() -> None:
     print(f"  Output    : {args.output_dir}")
 
     # -----------------------------------------------------------------------
-    # Step 1: preprocess images ONCE with a temporary pipeline, then unload.
+    # Step 1: preprocess images using only the BiRefNet rembg model (~885 MB).
     #
-    # Silhouettes for space carving are extracted by calling rembg DIRECTLY
-    # on the raw RGB images (extract_silhouette_rembg).  preprocess_image()
-    # must NOT be used for silhouettes: it premultiplies alpha into RGB and
-    # drops the alpha channel, so any subsequent RGBA conversion gives
-    # alpha=255 everywhere → 100% scaffold density.
+    # The full 4B pipeline (~22.6 GB) is NOT loaded here.  Loading it twice
+    # in sequence (once for preprocessing, once per condition) exhausts system
+    # RAM and triggers the OS OOM killer before any condition starts.
+    #
+    # Silhouettes for space carving are also extracted here from the raw RGB
+    # images (NOT from the preprocessed output, which premultiplies alpha into
+    # RGB and drops the alpha channel → all-255 alpha → 100% scaffold density).
     # -----------------------------------------------------------------------
-    print_section("Preprocessing images (temp pipeline)")
+    print_section("Preprocessing images")
     t0 = time.time()
-    tmp_pipeline = load_pipeline(args.model)
+    print(f"  Loading BiRefNet ({args.rembg_model}) ...")
+    rembg_model = load_rembg_model(args.rembg_model)
 
     n = len(args.images)
     raw_images = [Image.open(p).convert("RGB") for p in args.images]
-    images = [tmp_pipeline.preprocess_image(img) for img in raw_images]
+    images = [preprocess_image_standalone(img, rembg_model) for img in raw_images]
     print(f"  Preprocessed {n} image(s) in {time.time() - t0:.1f}s")
 
     if args.azimuths is not None:
@@ -673,7 +734,7 @@ def main() -> None:
     ):
         print_section("Building visual-hull scaffold")
         scaffold_masks = [
-            extract_silhouette_rembg(tmp_pipeline, raw_img) for raw_img in raw_images
+            extract_silhouette_rembg(rembg_model, raw_img) for raw_img in raw_images
         ]
         scaffold_rotations = [
             make_look_at_rotation(az, args.elevation) for az in azimuths
@@ -707,8 +768,8 @@ def main() -> None:
             "density_pct": round(density, 2),
         }
 
-    print_section("Unloading temp pipeline")
-    unload_pipeline(tmp_pipeline)
+    print_section("Unloading BiRefNet")
+    unload_rembg_model(rembg_model)
     print("  GPU memory cleared.")
 
     # -----------------------------------------------------------------------
