@@ -307,17 +307,32 @@ def save_obj(mesh, cond_dir: str) -> str:
 
 def save_preview(mesh, cond_dir: str, resolution: int = 512) -> Optional[str]:
     """
-    Render a 4-view PBR snapshot and save as preview.png.
+    Render a 4-view snapshot and save as preview.png.
 
-    Dispatches automatically: MeshWithVoxel → PbrMeshRenderer,
-    plain Mesh → MeshRenderer.  Must be called while GPU is still loaded.
+    For textured meshes (MeshWithVoxel / MeshWithPbrMaterial) a synthetic
+    uniform-grey EnvMap is created on-the-fly so PbrMeshRenderer gets the
+    mandatory envmap argument it requires.  For geometry-only Mesh objects
+    MeshRenderer is used and no envmap is needed.
+
+    Key preference: "shaded" (PBR) → "normal" (geometry) → first available.
     """
     from trellis2.utils import render_utils
+    from trellis2.representations import MeshWithVoxel, MeshWithPbrMaterial
     try:
+        render_kwargs = {}
+        if isinstance(mesh, (MeshWithVoxel, MeshWithPbrMaterial)):
+            from trellis2.renderers.pbr_mesh_renderer import EnvMap
+            env_img = torch.ones(16, 32, 3, dtype=torch.float32,
+                                 device=mesh.vertices.device) * 0.7
+            render_kwargs["envmap"] = EnvMap(env_img)
+
         snapshot = render_utils.render_snapshot(
             mesh, resolution=resolution, r=2, fov=36, nviews=4,
+            **render_kwargs,
         )
-        frames = snapshot.get("shaded", next(iter(snapshot.values())))
+        frames = snapshot.get("shaded",
+                 snapshot.get("normal",
+                 next(iter(snapshot.values()))))
         strip = np.concatenate(frames[:4], axis=1)
         path = os.path.join(cond_dir, "preview.png")
         Image.fromarray(strip).save(path)
