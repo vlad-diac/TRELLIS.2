@@ -104,6 +104,17 @@ _scripts_dir = os.path.dirname(os.path.abspath(__file__))
 if _scripts_dir not in sys.path:
     sys.path.insert(0, _scripts_dir)
 
+# #region agent log
+import json as _json
+_DBG_LOG = os.path.join(_repo_root, ".cursor", "debug-a41768.log")
+def _dbg(loc, msg, data, hyp, run_id="pre-fix"):
+    entry = {"sessionId": "a41768", "runId": run_id, "hypothesisId": hyp,
+             "timestamp": int(time.time() * 1000), "location": loc,
+             "message": msg, "data": data}
+    with open(_DBG_LOG, "a") as _f:
+        _f.write(_json.dumps(entry) + "\n")
+# #endregion
+
 os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
@@ -438,8 +449,31 @@ def _run_stages(
         stage_times["tex_slat_s"] = round(t[0], 2)
         torch.cuda.empty_cache()
 
+        # #region agent log
+        _dbg("_run_stages:before_decode", "GPU mem before decode_latent",
+             {"alloc_gib": round(torch.cuda.memory_allocated()/1e9, 3),
+              "reserved_gib": round(torch.cuda.memory_reserved()/1e9, 3),
+              "free_gib": round((torch.cuda.get_device_properties(0).total_memory
+                                 - torch.cuda.memory_reserved())/1e9, 3),
+              "cond_512_alive": cond_512 is not None,
+              "cond_1024_alive": cond_1024 is not None}, "H-A,H-C")
+        # #endregion
+
         with log_step("decode + export (textured)", 5, 5) as t:
             meshes = pipeline.decode_latent(shape_slat, tex_slat, res)
+
+            # #region agent log
+            _dbg("_run_stages:after_decode_before_glb", "GPU mem after decode_latent, before save_glb",
+                 {"alloc_gib": round(torch.cuda.memory_allocated()/1e9, 3),
+                  "reserved_gib": round(torch.cuda.memory_reserved()/1e9, 3),
+                  "free_gib": round((torch.cuda.get_device_properties(0).total_memory
+                                     - torch.cuda.memory_reserved())/1e9, 3),
+                  "shape_slat_alive": shape_slat is not None,
+                  "tex_slat_alive": tex_slat is not None,
+                  "cond_512_alive": cond_512 is not None,
+                  "cond_1024_alive": cond_1024 is not None}, "H-B,H-E")
+            # #endregion
+
             model_path = save_glb(
                 pipeline, meshes[0], res, cond_dir,
                 args.texture_size, args.decimation_target,
@@ -447,12 +481,28 @@ def _run_stages(
         stage_times["decode_s"] = round(t[0], 2)
         del shape_slat, tex_slat
 
+        # #region agent log
+        _dbg("_run_stages:after_del_slats", "GPU mem after del shape_slat+tex_slat",
+             {"alloc_gib": round(torch.cuda.memory_allocated()/1e9, 3),
+              "reserved_gib": round(torch.cuda.memory_reserved()/1e9, 3),
+              "free_gib": round((torch.cuda.get_device_properties(0).total_memory
+                                 - torch.cuda.memory_reserved())/1e9, 3)}, "H-B")
+        # #endregion
+
     # Free conditioning + SLAT tensors before the preview renderer allocates
     # its buffers.  The pipeline weights (~22.6 GiB) stay loaded; we only
     # need to reclaim the working tensors (~300–600 MiB) so nvdiffrast can
     # render.
     del cond_512, cond_1024
     torch.cuda.empty_cache()
+
+    # #region agent log
+    _dbg("_run_stages:after_del_conds", "GPU mem after del cond_512+cond_1024 + empty_cache",
+         {"alloc_gib": round(torch.cuda.memory_allocated()/1e9, 3),
+          "reserved_gib": round(torch.cuda.memory_reserved()/1e9, 3),
+          "free_gib": round((torch.cuda.get_device_properties(0).total_memory
+                             - torch.cuda.memory_reserved())/1e9, 3)}, "H-A,H-D")
+    # #endregion
 
     if model_path:
         print(f"       → {model_path}")
