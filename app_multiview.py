@@ -698,7 +698,7 @@ def main() -> None:
             outputs=[log_out, prev_img, glb_out, stage_tbl, summ_json],
         )
 
-    demo.launch()
+    demo.launch(server_name="0.0.0.0", server_port=7860)
 
 
 if __name__ == "__main__":
