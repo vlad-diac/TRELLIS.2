@@ -254,18 +254,44 @@ def run_subprocess_stream(cmd: List[str]) -> Iterator[str]:
     proc.wait()
 
 
+def _abspath_if_file(p: Optional[str]) -> Optional[str]:
+    if not p or not isinstance(p, str):
+        return None
+    ap = os.path.abspath(os.path.expanduser(p.strip()))
+    return ap if os.path.isfile(ap) else None
+
+
+def artifacts_from_run_dir(run_dir: str) -> Tuple[Optional[str], Optional[str], Optional[dict]]:
+    """Load preview + 3D path from summary.json when present, else conventional names."""
+    run_dir = os.path.abspath(run_dir)
+    summ_path = os.path.join(run_dir, "summary.json")
+    data: Optional[dict] = None
+    if os.path.isfile(summ_path):
+        try:
+            with open(summ_path, encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            data = None
+    prev: Optional[str] = None
+    model: Optional[str] = None
+    if data:
+        prev = _abspath_if_file(data.get("preview_path"))
+        model = _abspath_if_file(data.get("model_path"))
+    if not prev:
+        prev = _abspath_if_file(os.path.join(run_dir, "preview.png"))
+    if not model:
+        for name in ("model.glb", "model.gltf", "model.obj"):
+            model = _abspath_if_file(os.path.join(run_dir, name))
+            if model:
+                break
+    return prev, model, data
+
+
 def load_result_paths(output_dir: str, strategy: str) -> Tuple[Optional[str], Optional[str], Optional[dict]]:
     d = latest_strategy_run_dir(output_dir, strategy)
     if not d:
         return None, None, None
-    summ = os.path.join(d, "summary.json")
-    data: Optional[dict] = None
-    if os.path.isfile(summ):
-        with open(summ, encoding="utf-8") as f:
-            data = json.load(f)
-    prev = os.path.join(d, "preview.png") if os.path.isfile(os.path.join(d, "preview.png")) else None
-    glb = os.path.join(d, "model.glb") if os.path.isfile(os.path.join(d, "model.glb")) else None
-    return prev, glb, data
+    return artifacts_from_run_dir(d)
 
 
 def main() -> None:
@@ -394,10 +420,24 @@ def main() -> None:
         if summ and summ.get("stage_times"):
             st = summ["stage_times"]
             tbl = [[k, st[k]] for k in sorted(st.keys())]
+        info_keys = (
+            "strategy",
+            "mode",
+            "elapsed_s",
+            "voxels",
+            "error",
+            "run_dir",
+            "model_path",
+            "preview_path",
+        )
         info = json.dumps(
-            {k: summ[k] for k in ("strategy", "mode", "elapsed_s", "voxels", "error") if summ and k in summ},
+            {k: summ[k] for k in info_keys if summ and k in summ},
             indent=2,
         ) if summ else ""
+        # Clear Model3D first, then set path — avoids stale mesh when the viewer
+        # does not refresh on a new file at a new path (Gradio / browser quirk).
+        if glb:
+            yield log, prev, None, tbl, info
         yield log, prev, glb, tbl, info
 
     with gr.Blocks(title="TRELLIS.2 Multi-view runs") as demo:
@@ -563,8 +603,25 @@ def main() -> None:
             outputs=[log_out, prev_img, glb_out, stage_tbl, summ_json],
         )
 
-        gr.Markdown("## History (recent `summary.json` under output dir)")
+        gr.Markdown(
+            "## History (recent `summary.json` under output dir)\n\n"
+            "Click any cell in a row to select it, then click **Load selected run**."
+        )
+        HIST_COL_DIR = 5
+
+        def _hist_tbl_as_rows(tbl: Any) -> Optional[list]:
+            if tbl is None:
+                return None
+            if isinstance(tbl, list):
+                return tbl
+            tlist = getattr(tbl, "tolist", None)
+            if callable(tlist):
+                out = tlist()
+                return out if isinstance(out, list) else None
+            return None
+
         hist_btn = gr.Button("Refresh history")
+        load_hist_btn = gr.Button("Load selected run")
 
         def load_hist(od: str) -> Any:
             rows = scan_summaries(od or DEFAULT_OUT)
@@ -583,7 +640,63 @@ def main() -> None:
                 for r in scan_summaries(DEFAULT_OUT)
             ],
         )
+        hist_selected_row = gr.State(-1)
+
+        def on_hist_cell_select(evt: Any) -> int:
+            idx = getattr(evt, "index", None)
+            if isinstance(idx, (list, tuple)) and len(idx) >= 1:
+                try:
+                    return int(idx[0])
+                except (TypeError, ValueError):
+                    return -1
+            return -1
+
+        def load_selected_run(
+            tbl: Any,
+            row: int,
+            logbox: str,
+        ) -> Iterator[Tuple[str, Any, Any, Any, Any]]:
+            log = logbox or ""
+            rows = _hist_tbl_as_rows(tbl)
+            if rows is None or row < 0 or row >= len(rows):
+                log += "\n[History] Select a row in the table, then click Load selected run.\n"
+                yield log, gr.update(), gr.update(), gr.update(), gr.update()
+                return
+            row_vals = rows[row]
+            if len(row_vals) <= HIST_COL_DIR:
+                log += "\n[History] Row has no dir column.\n"
+                yield log, gr.update(), gr.update(), gr.update(), gr.update()
+                return
+            run_dir = str(row_vals[HIST_COL_DIR]).strip()
+            if not run_dir or not os.path.isdir(run_dir):
+                log += f"\n[History] Not a directory: {run_dir!r}\n"
+                yield log, gr.update(), gr.update(), gr.update(), gr.update()
+                return
+            prev, model, summ = artifacts_from_run_dir(run_dir)
+            tbl_out = None
+            if summ and summ.get("stage_times"):
+                st = summ["stage_times"]
+                tbl_out = [[k, st[k]] for k in sorted(st.keys())]
+            keys = ("strategy", "mode", "elapsed_s", "voxels", "error", "run_dir", "model_path", "preview_path")
+            info = (
+                json.dumps({k: summ[k] for k in keys if summ and k in summ}, indent=2)
+                if summ
+                else json.dumps({"run_dir": run_dir}, indent=2)
+            )
+            log += f"\n[History] Loaded {run_dir}\n"
+            if model is None:
+                log += "  (no mesh file found — check summary model_path or model.glb in run dir)\n"
+            if model:
+                yield log, prev, None, tbl_out, info
+            yield log, prev, model, tbl_out, info
+
         hist_btn.click(load_hist, inputs=[out_dir], outputs=[hist_tbl])
+        hist_tbl.select(on_hist_cell_select, outputs=[hist_selected_row])
+        load_hist_btn.click(
+            load_selected_run,
+            inputs=[hist_tbl, hist_selected_row, log_out],
+            outputs=[log_out, prev_img, glb_out, stage_tbl, summ_json],
+        )
 
     demo.launch()
 
