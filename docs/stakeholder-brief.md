@@ -277,6 +277,50 @@ For adapting TRELLIS.2 to marine vessel data without full retraining, the Sparse
 | 1536³ generation time (H100) | ~60 seconds |
 | Benchmark measurements in paper | Reported on NVIDIA A100 |
 
+### 6.5 Benchmark run timings (measured, 2026-05-11)
+
+All runs were executed on an NVIDIA RTX 3090 (24 GB) using TRELLIS.2-4B. Load time (~78–92 s) reflects one-time model weight loading per condition and is excluded from stage breakdowns below. Conditions marked **OOM** failed with CUDA out-of-memory and produced no output.
+
+#### Runs with textures (`--skip-tex` not set)
+
+| Run ID | Pipeline | Views | Condition | Total (s) | Sparse Structure (s) | Shape SLAT (s) | Tex SLAT (s) | Decode (s) |
+|--------|----------|-------|-----------|----------:|---------------------:|---------------:|-------------:|-----------:|
+| 20260511_090441 | 1024_cascade | 1 | baseline | 175.99 | 6.80 | 12.81 | 5.45 | 53.00 |
+
+#### Runs without textures (`--skip-tex`)
+
+| Run ID | Pipeline | Views | Condition | Total (s) | Sparse Structure (s) | Shape SLAT (s) | Decode (s) |
+|--------|----------|-------|-----------|----------:|---------------------:|---------------:|-----------:|
+| 20260511_090949 | 1024_cascade | 1 | baseline | 115.38 | 6.36 | 11.55 | 6.36 |
+| 20260511_091709 | 1024_cascade | 1 | baseline | 117.70 | 6.34 | 11.59 | 6.63 |
+| 20260511_091709 | 1024_cascade | 1 | P1-mean | 105.58 | 6.32 | 11.06 | 6.07 |
+| 20260511_091709 | 1024_cascade | 1 | P1-concat | 106.56 | 6.28 | 11.16 | 6.35 |
+| 20260511_092717 | 1024_cascade | 1 | baseline | 118.21 | 6.81 | 11.61 | 6.56 |
+| 20260511_092717 | 1024_cascade | 1 | P1-mean | 106.84 | 6.36 | 10.97 | 5.90 |
+| 20260511_092717 | 1024_cascade | 1 | P1-concat | 104.57 | 6.47 | 11.06 | 5.71 |
+| 20260511_092717 | 1024_cascade | 1 | P2-scaffold | OOM | — | — | — |
+| 20260511_092717 | 1024_cascade | 1 | P2-scaffold+P1 | OOM | — | — | — |
+| 20260511_093621 | 1024_cascade | 1 | baseline | 113.05 | 6.33 | 11.55 | 2.39 |
+| 20260511_093621 | 1024_cascade | 1 | P1-mean | 102.39 | 6.35 | 11.23 | 1.70 |
+| 20260511_093621 | 1024_cascade | 1 | P1-concat | 98.23 | 6.21 | 11.37 | 1.64 |
+| 20260511_093621 | 1024_cascade | 1 | P2-scaffold | OOM | — | — | — |
+| 20260511_093621 | 1024_cascade | 1 | P2-scaffold+P1 | OOM | — | — | — |
+| 20260511_095509 | 1024_cascade | 3 | baseline | 111.22 | 6.41 | 11.68 | 1.90 |
+| 20260511_095509 | 1024_cascade | 3 | P1-mean | 103.51 | 6.44 | 14.90 | 1.90 |
+| 20260511_095509 | 1024_cascade | 3 | P1-concat | OOM | — | — | — |
+| 20260511_095509 | 1024_cascade | 3 | P2-scaffold | OOM | — | — | — |
+| 20260511_095509 | 1024_cascade | 3 | P2-scaffold+P1 | OOM | — | — | — |
+| 20260511_101815 | 512 | 4 | baseline | 101.08 | 6.48 | 4.36 | 1.32 |
+| 20260511_101815 | 512 | 4 | P1-mean | 90.11 | 6.30 | 3.63 | 0.70 |
+| 20260511_101815 | 512 | 4 | P1-concat | 93.09 | 7.25 | 5.13 | 0.92 |
+
+**Key observations:**
+- Skipping textures reduces total wall time by roughly **34 %** (176 s → 116 s for a single-view 1024_cascade run), with nearly all the saving coming from the decode stage (53 s → ≤7 s).
+- The Tex SLAT stage itself adds only ~5 s; the bulk of texture cost is mesh UV unwrapping and texture baking inside decode.
+- Switching from 1024_cascade to the 512 pipeline cuts shape SLAT time from ~11 s to ~4 s and reduces overall wall time to ~90–101 s per condition (no textures).
+- P2-scaffold (scaffold-bypass) conditions consistently hit OOM on the 24 GB RTX 3090 with 1024_cascade; this path requires either a larger GPU or reduced working resolution.
+- P1-mean conditioning on 3 views increases shape SLAT to 14.9 s vs 11.7 s for the single-view baseline, reflecting the larger fused condition token.
+
 ---
 
 ## 7. Dataset Requirements
@@ -409,3 +453,10 @@ Despite the single-image limitation, TRELLIS.2 has properties that make it parti
 | Internal pipeline deep-dive | [pipeline-findings.md](pipeline-findings.md) |
 | Internal SLAT conceptual notes | [research-topics.md](research-topics.md) |
 | Internal multi-image failure analysis | [trellis-multi-image-conclusion.md](trellis-multi-image-conclusion.md) |
+
+### Operational tooling
+
+- **Split run scripts:** [`scripts/runs/`](../scripts/runs/) — one subprocess per strategy (`baseline`, `p1_condition_fusion`, `p2_scaffold`, `sparse_fusion`, `slat_fusion`) with `summary.json` + `preview.png` per run folder under `out/`.
+- **Benchmark dispatcher:** [`scripts/benchmark_multiview.py`](../scripts/benchmark_multiview.py) (unchanged CLI; now subprocess-based).
+- **Fusion test dispatcher:** [`scripts/test_multi_image_fusion.py`](../scripts/test_multi_image_fusion.py).
+- **Visualizer:** [`app_multiview.py`](../app_multiview.py) — select inputs from `./input`, run strategies, inspect GLBs without loading PyTorch in the UI process.

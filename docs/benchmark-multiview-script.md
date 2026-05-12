@@ -77,6 +77,93 @@ gantt
 
 ---
 
+## Azimuth & Elevation — Camera Geometry
+
+Azimuth and elevation define the **camera orbit positions** used by the visual-hull computation in Phase 1b. They have no effect on the baseline, P1-mean, or P1-concat conditions — those conditions operate purely in DINOv3 feature space and carry no notion of geometric camera pose.
+
+### Where they enter the computation
+
+The only code path that consumes azimuth/elevation is the scaffold pipeline:
+
+```python
+# main() — Phase 1b
+scaffold_rotations = [
+    make_look_at_rotation(az, args.elevation) for az in azimuths
+]
+occupancy = space_carve(
+    scaffold_masks, scaffold_rotations,
+    grid_size=ss_res, min_views=min_views,
+)
+```
+
+`make_look_at_rotation(azimuth, elevation)` returns a **look-at rotation matrix** for a camera placed at:
+- `azimuth` degrees around the vertical (Y) axis — 0° = front, 90° = right, 180° = rear, 270° = left
+- `elevation` degrees above the horizontal plane — positive values point the camera down toward the object
+
+These rotation matrices are forwarded to `space_carve`, which projects each binary silhouette mask into the 3D voxel grid and marks a voxel as occupied only if it falls inside the foreground silhouette in at least `min_views` projections.
+
+```mermaid
+flowchart LR
+    az["azimuths [az₀…azₙ]"]
+    el["elevation (scalar)"]
+    rot["make_look_at_rotation\nper view → R₀…Rₙ"]
+    sil["silhouette masks\n(binary, H×W)"]
+    carve["space_carve\n(masks × rotations)\n→ occupancy bool vol"]
+
+    az & el --> rot
+    sil & rot --> carve
+```
+
+The resulting `occupancy` volume replaces Stage 2 (sparse-structure diffusion) entirely for P2 conditions by providing voxel coordinates that bypass the diffusion model.
+
+### Auto-azimuth default
+
+When `--azimuths` is omitted the script distributes views evenly around the full circle:
+
+```python
+azimuths = [360.0 * i / n for i in range(n)]
+```
+
+| N views | Auto azimuths |
+|---------|---------------|
+| 2 | 0°, 180° |
+| 3 | 0°, 120°, 240° |
+| 4 | 0°, 90°, 180°, 270° |
+| 6 | 0°, 60°, 120°, 180°, 240°, 300° |
+
+This is appropriate for images captured at regular intervals around an object. For photos taken at irregular angles, always supply explicit `--azimuths` — one value per input image in the same order as the image list.
+
+### Impact on visual-hull quality
+
+The rotation matrices must reflect the **actual camera positions** used when photographing the object. Mismatches distort or inflate the hull:
+
+| Mismatch | Effect on hull |
+|----------|----------------|
+| Wrong azimuth order | Silhouettes projected from wrong directions → noisy, asymmetric volume |
+| All azimuths identical | All views project from the same direction → hull becomes a tube/slab instead of a closed volume |
+| Elevation too high | Camera looks steeply down → hull collapses vertically into a flat disc |
+| Elevation at 0° | Camera at the horizon → tall objects may lose top coverage |
+| Elevation negative | Camera below the object → only valid for explicit underside captures |
+
+The script prints a density warning whenever more than 80% of the grid is occupied:
+
+```
+[WARN] density >80% — hull may be nearly full.
+       Check azimuths or try --min-views-scaffold with a lower value.
+```
+
+This almost always indicates that the azimuths don't match the actual capture positions, or that `--elevation` is far from the real camera height.
+
+### Elevation is shared across all views
+
+Unlike `--azimuths` (one value per image), `--elevation` is a **single scalar** applied to every view. All cameras are assumed to orbit at the same elevation angle. This is a sound approximation for turntable-style captures; for mixed-elevation rigs (e.g. one overhead shot and several side shots) the space carve will be an approximation.
+
+### No effect on P1 / baseline conditions
+
+Azimuth and elevation values are parsed, logged in `summary.json` under `azimuths_deg` and `elevation_deg`, and printed at startup — but they are **not consumed** by any code path in `run_baseline`, `run_p1`, or `_run_stages`. Running with `--skip-scaffold` therefore makes these flags completely inert with respect to output geometry.
+
+---
+
 ## Condition 1 — `baseline` (Default Single-Image Pipeline)
 
 The reference point. Only the first image is used throughout all five stages.
@@ -526,3 +613,21 @@ python scripts/benchmark_multiview.py \
 | `--decimation-target` | `500000` | Target face count for mesh decimation |
 | `--min-views-scaffold` | all views | Min views a voxel must survive space carving |
 | `--conditions` | all 5 | Run only the specified subset of conditions |
+
+---
+
+## Run topology (split scripts + UI)
+
+[`scripts/benchmark_multiview.py`](../scripts/benchmark_multiview.py) is a **dispatcher**: it runs one subprocess per condition so the 4B pipeline is fully unloaded between conditions. Each subprocess targets [`scripts/runs/`](../scripts/runs/) (`baseline.py`, `p1_condition_fusion.py`, `p2_scaffold.py`, etc.) with `--dest-dir run_…/<condition_folder>/`.
+
+Per-condition outputs still match this guide (`model.glb` / `preview.png` / `summary.json` per folder). **Note:** BiRefNet preprocessing now runs inside each subprocess (slightly more wall time than the old shared preprocess, but the same VRAM safety).
+
+| Condition | Underlying script |
+|-----------|-------------------|
+| baseline | `runs/baseline.py` |
+| P1-mean | `runs/p1_condition_fusion.py --mode mean` |
+| P1-concat | `runs/p1_condition_fusion.py --mode concat` |
+| P2-scaffold | `runs/p2_scaffold.py --cond-fusion primary` |
+| P2-scaffold+P1 | `runs/p2_scaffold.py --cond-fusion mean` |
+
+**Gradio visualizer:** [`app_multiview.py`](../app_multiview.py) — pick images under `./input`, choose a strategy, stream logs, inspect GLB + previews (does not import `trellis2` in the UI process).

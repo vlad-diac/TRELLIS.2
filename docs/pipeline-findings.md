@@ -799,6 +799,30 @@ This maps directly to **Strategy B** being the highest-value intervention.
 
 ---
 
+## Benchmark Run Timings (2026-05-11, RTX 3090 24 GB)
+
+Measured on NVIDIA RTX 3090 (24 GB VRAM), TRELLIS.2-4B, seed 42. Model load time (~78–92 s per condition) is excluded from all stage columns. OOM conditions are omitted.
+
+| Pipeline | Views | Textures | Condition | Total (s) | Sparse Struct (s) | Shape SLAT (s) | Tex SLAT (s) | Decode (s) |
+|----------|-------|----------|-----------|----------:|------------------:|---------------:|-------------:|-----------:|
+| 1024_cascade | 1 | Yes | baseline | 176 | 6.8 | 12.8 | 5.5 | 53.0 |
+| 1024_cascade | 1 | No | baseline | ~115 | 6.4 | 11.6 | — | ~6.0 |
+| 1024_cascade | 1 | No | P1-mean | ~105 | 6.3 | 11.1 | — | ~6.1 |
+| 1024_cascade | 1 | No | P1-concat | ~103 | 6.3 | 11.2 | — | ~6.0 |
+| 1024_cascade | 3 | No | baseline | 111 | 6.4 | 11.7 | — | 1.9 |
+| 1024_cascade | 3 | No | P1-mean | 104 | 6.4 | 14.9 | — | 1.9 |
+| 512 | 4 | No | baseline | 101 | 6.5 | 4.4 | — | 1.3 |
+| 512 | 4 | No | P1-mean | 90 | 6.3 | 3.6 | — | 0.7 |
+| 512 | 4 | No | P1-concat | 93 | 7.3 | 5.1 | — | 0.9 |
+
+**Takeaways:**
+- Skipping textures saves ~34 % of total wall time on 1024_cascade; almost all the saving is in the decode stage (53 s → ~6 s), not Tex SLAT (5.5 s).
+- The 512 pipeline halves shape SLAT time (~4 s vs ~12 s) at the cost of lower geometric resolution.
+- P1-mean with 3 views inflates shape SLAT to 14.9 s (vs 11.7 s baseline) due to the larger fused condition token.
+- P2-scaffold and P1-concat with ≥ 3 views exceed the 24 GB VRAM budget at 1024_cascade resolution.
+
+---
+
 ## Summary — Where Each Concept Lives in the Code
 
 | Research Concept                  | File                                            | Key Symbol                              |
@@ -816,3 +840,11 @@ This maps directly to **Strategy B** being the highest-value intervention.
 | O-Voxel Z-order serialization     | `o-voxel/o_voxel/serialize.py`                  | `encode_seq` (z_order / hilbert)        |
 | Full pipeline orchestration       | `pipelines/trellis2_image_to_3d.py`             | `Trellis2ImageTo3DPipeline.run()`       |
 | PBR texture layout                | `pipelines/trellis2_image_to_3d.py`             | `pbr_attr_layout`                       |
+
+---
+
+## Run topology — scripts and UI
+
+Research runs are driven by small CLIs in [`scripts/runs/`](../scripts/runs/) (one strategy per process for clean VRAM). Helpers live in [`scripts/runs/_common.py`](../scripts/runs/_common.py). The full benchmark matrix is still invoked via [`scripts/benchmark_multiview.py`](../scripts/benchmark_multiview.py), which **subprocesses** into those scripts. Multi-image fusion tests: [`scripts/test_multi_image_fusion.py`](../scripts/test_multi_image_fusion.py) → `sparse_fusion.py` / `slat_fusion.py` / `baseline.py`.
+
+**Gradio:** [`app_multiview.py`](../app_multiview.py) scans `./input`, launches a chosen script, streams stdout, and displays `summary.json` + previews.

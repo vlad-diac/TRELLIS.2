@@ -370,11 +370,28 @@ flowchart LR
     multi_check -- no --> summary
 ```
 
-No JSON, no preview images, no intermediate files are written — only the final GLB(s). The summary (voxel counts, timing, delta %) is printed to stdout only.
+No timestamped flat GLBs are written by the dispatcher; instead each underlying run creates a folder `out/<strategy>_YYYYMMDD_HHMMSS/` with `model.glb`, `preview.png`, and `summary.json`. The summary (voxel counts, timing) is in `summary.json`; logs still go to stdout.
 
 ---
 
-## CLI Quick Reference
+## Run topology (split scripts + UI)
+
+The implementation is split so **each strategy runs in its own process** (full RAM/VRAM release between runs):
+
+| Strategy | Script |
+|----------|--------|
+| Baseline (single image) | [`scripts/runs/baseline.py`](../scripts/runs/baseline.py) |
+| P1 (`mean` / `concat` conditioning) | [`scripts/runs/p1_condition_fusion.py`](../scripts/runs/p1_condition_fusion.py) |
+| P2 visual hull + SLAT | [`scripts/runs/p2_scaffold.py`](../scripts/runs/p2_scaffold.py) |
+| Sparse fusion only (`primary` SLAT) | [`scripts/runs/sparse_fusion.py`](../scripts/runs/sparse_fusion.py) |
+| Sparse + SLAT feature fusion | [`scripts/runs/slat_fusion.py`](../scripts/runs/slat_fusion.py) |
+
+Shared helpers: [`scripts/runs/_common.py`](../scripts/runs/_common.py).
+
+Legacy entrypoint [`scripts/test_multi_image_fusion.py`](../scripts/test_multi_image_fusion.py) shells out to the scripts above (CLI unchanged).
+
+**Visualizer:** [`app_multiview.py`](../app_multiview.py) — Gradio UI that scans `./input`, runs a chosen strategy via subprocess, streams logs, and loads the latest `preview.png` / `model.glb` / `summary.json`.
+
 
 ```
 # Baseline (single image)
