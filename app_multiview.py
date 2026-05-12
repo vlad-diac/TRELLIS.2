@@ -605,71 +605,72 @@ def main() -> None:
 
         gr.Markdown(
             "## History (recent `summary.json` under output dir)\n\n"
-            "Click any cell in a row to select it, then click **Load selected run**."
+            "Click a row to highlight it, then click **Load selected run**."
         )
-        HIST_COL_DIR = 5
+        _HIST_COL_DIR = 5
 
-        def _hist_tbl_as_rows(tbl: Any) -> Optional[list]:
-            if tbl is None:
-                return None
-            if isinstance(tbl, list):
-                return tbl
-            tlist = getattr(tbl, "tolist", None)
-            if callable(tlist):
-                out = tlist()
-                return out if isinstance(out, list) else None
-            return None
+        def _hist_rows_from_summary(od: str) -> list:
+            rows = scan_summaries(od or DEFAULT_OUT)
+            return [
+                [r["started"], r["strategy"], r["mode"], r["voxels"], r["elapsed_s"], r["dir"]]
+                for r in rows
+            ]
 
         hist_btn = gr.Button("Refresh history")
-        load_hist_btn = gr.Button("Load selected run")
+        load_hist_btn = gr.Button("Load selected run", variant="secondary")
 
-        def load_hist(od: str) -> Any:
-            rows = scan_summaries(od or DEFAULT_OUT)
-            return gr.Dataframe(
-                value=[
-                    [r["started"], r["strategy"], r["mode"], r["voxels"], r["elapsed_s"], r["dir"]]
-                    for r in rows
-                ],
-                headers=["started", "strategy", "mode", "voxels", "elapsed_s", "dir"],
-            )
-
+        # non-interactive so clicking fires select instead of entering edit mode
         hist_tbl = gr.Dataframe(
             headers=["started", "strategy", "mode", "voxels", "elapsed_s", "dir"],
-            value=[
-                [r["started"], r["strategy"], r["mode"], r["voxels"], r["elapsed_s"], r["dir"]]
-                for r in scan_summaries(DEFAULT_OUT)
-            ],
+            value=_hist_rows_from_summary(DEFAULT_OUT),
+            interactive=False,
         )
-        hist_selected_row = gr.State(-1)
+        # state holds the run dir path directly — avoids re-indexing the table later
+        hist_selected_dir = gr.State("")
 
-        def on_hist_cell_select(evt: Any) -> int:
-            idx = getattr(evt, "index", None)
-            if isinstance(idx, (list, tuple)) and len(idx) >= 1:
+        def on_hist_select(evt: gr.SelectData, tbl: Any) -> str:
+            """Store the run dir of the clicked row into state."""
+            row_idx = evt.index[0] if hasattr(evt, "index") and evt.index else None
+            if row_idx is None:
+                return ""
+            try:
+                row_idx = int(row_idx)
+            except (TypeError, ValueError):
+                return ""
+            # tbl may arrive as list-of-lists or pandas DataFrame
+            if isinstance(tbl, list):
+                rows = tbl
+            else:
                 try:
-                    return int(idx[0])
-                except (TypeError, ValueError):
-                    return -1
-            return -1
+                    rows = tbl.values.tolist()
+                except Exception:
+                    return ""
+            if row_idx < 0 or row_idx >= len(rows):
+                return ""
+            row_vals = rows[row_idx]
+            if len(row_vals) <= _HIST_COL_DIR:
+                return ""
+            return str(row_vals[_HIST_COL_DIR]).strip()
+
+        def load_hist(od: str) -> Any:
+            return gr.Dataframe(
+                value=_hist_rows_from_summary(od or DEFAULT_OUT),
+                headers=["started", "strategy", "mode", "voxels", "elapsed_s", "dir"],
+                interactive=False,
+            )
 
         def load_selected_run(
-            tbl: Any,
-            row: int,
+            run_dir: str,
             logbox: str,
         ) -> Iterator[Tuple[str, Any, Any, Any, Any]]:
             log = logbox or ""
-            rows = _hist_tbl_as_rows(tbl)
-            if rows is None or row < 0 or row >= len(rows):
-                log += "\n[History] Select a row in the table, then click Load selected run.\n"
+            run_dir = (run_dir or "").strip()
+            if not run_dir:
+                log += "\n[History] Click a row in the table first, then Load selected run.\n"
                 yield log, gr.update(), gr.update(), gr.update(), gr.update()
                 return
-            row_vals = rows[row]
-            if len(row_vals) <= HIST_COL_DIR:
-                log += "\n[History] Row has no dir column.\n"
-                yield log, gr.update(), gr.update(), gr.update(), gr.update()
-                return
-            run_dir = str(row_vals[HIST_COL_DIR]).strip()
-            if not run_dir or not os.path.isdir(run_dir):
-                log += f"\n[History] Not a directory: {run_dir!r}\n"
+            if not os.path.isdir(run_dir):
+                log += f"\n[History] Run directory not found: {run_dir!r}\n"
                 yield log, gr.update(), gr.update(), gr.update(), gr.update()
                 return
             prev, model, summ = artifacts_from_run_dir(run_dir)
@@ -685,16 +686,16 @@ def main() -> None:
             )
             log += f"\n[History] Loaded {run_dir}\n"
             if model is None:
-                log += "  (no mesh file found — check summary model_path or model.glb in run dir)\n"
+                log += "  (no mesh found — check summary model_path or model.glb in run dir)\n"
             if model:
                 yield log, prev, None, tbl_out, info
             yield log, prev, model, tbl_out, info
 
         hist_btn.click(load_hist, inputs=[out_dir], outputs=[hist_tbl])
-        hist_tbl.select(on_hist_cell_select, outputs=[hist_selected_row])
+        hist_tbl.select(on_hist_select, inputs=[hist_tbl], outputs=[hist_selected_dir])
         load_hist_btn.click(
             load_selected_run,
-            inputs=[hist_tbl, hist_selected_row, log_out],
+            inputs=[hist_selected_dir, log_out],
             outputs=[log_out, prev_img, glb_out, stage_tbl, summ_json],
         )
 

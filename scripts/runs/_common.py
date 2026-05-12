@@ -267,9 +267,24 @@ def save_obj(mesh, out_dir: str) -> str:
 
 def save_geometry_glb(mesh, out_dir: str) -> str:
     import trimesh
+    verts = mesh.vertices.cpu().float().numpy().copy()
+    # Convert from Z-up (TRELLIS internal) to Y-up (GLB standard):
+    # (x, y, z) → (x, z, −y)  — mirrors the transform in o_voxel/postprocess.py
+    verts[:, 1], verts[:, 2] = verts[:, 2].copy(), -verts[:, 1].copy()
     tm = trimesh.Trimesh(
-        vertices=mesh.vertices.cpu().float().numpy(),
+        vertices=verts,
         faces=mesh.faces.cpu().int().numpy(),
+        process=False,
+    )
+    # Attach a neutral grey PBR material so viewers don't fall back to
+    # position-as-colour shading when there is no texture.
+    tm.visual = trimesh.visual.TextureVisuals(
+        material=trimesh.visual.material.PBRMaterial(
+            baseColorFactor=[0.7, 0.7, 0.7, 1.0],
+            roughnessFactor=0.6,
+            metallicFactor=0.0,
+            doubleSided=True,
+        )
     )
     path = os.path.join(out_dir, "model.glb")
     tm.export(path)
