@@ -603,70 +603,45 @@ def main() -> None:
             outputs=[log_out, prev_img, glb_out, stage_tbl, summ_json],
         )
 
-        gr.Markdown(
-            "## History (recent `summary.json` under output dir)\n\n"
-            "Click a row to highlight it, then click **Load selected run**."
-        )
-        _HIST_COL_DIR = 5
+        gr.Markdown("## History (recent runs under output dir)")
 
-        def _hist_rows_from_summary(od: str) -> list:
+        def _hist_choices(od: str) -> List[Tuple[str, str]]:
+            """Return (label, run_dir) pairs for the dropdown."""
             rows = scan_summaries(od or DEFAULT_OUT)
-            return [
-                [r["started"], r["strategy"], r["mode"], r["voxels"], r["elapsed_s"], r["dir"]]
-                for r in rows
-            ]
+            choices = []
+            for r in rows:
+                label = "  |  ".join([
+                    str(r.get("started", ""))[:16],
+                    str(r.get("strategy", "")),
+                    str(r.get("mode", "")),
+                    f"{r.get('voxels', '')} vox",
+                    f"{r.get('elapsed_s', '')}s",
+                ])
+                choices.append((label, r["dir"]))
+            return choices
 
-        hist_btn = gr.Button("Refresh history")
-        load_hist_btn = gr.Button("Load selected run", variant="secondary")
-
-        # non-interactive so clicking fires select instead of entering edit mode
-        hist_tbl = gr.Dataframe(
-            headers=["started", "strategy", "mode", "voxels", "elapsed_s", "dir"],
-            value=_hist_rows_from_summary(DEFAULT_OUT),
-            interactive=False,
-        )
-        # state holds the run dir path directly — avoids re-indexing the table later
-        hist_selected_dir = gr.State("")
-
-        def on_hist_select(evt: gr.SelectData, tbl: Any) -> str:
-            """Store the run dir of the clicked row into state."""
-            row_idx = evt.index[0] if hasattr(evt, "index") and evt.index else None
-            if row_idx is None:
-                return ""
-            try:
-                row_idx = int(row_idx)
-            except (TypeError, ValueError):
-                return ""
-            # tbl may arrive as list-of-lists or pandas DataFrame
-            if isinstance(tbl, list):
-                rows = tbl
-            else:
-                try:
-                    rows = tbl.values.tolist()
-                except Exception:
-                    return ""
-            if row_idx < 0 or row_idx >= len(rows):
-                return ""
-            row_vals = rows[row_idx]
-            if len(row_vals) <= _HIST_COL_DIR:
-                return ""
-            return str(row_vals[_HIST_COL_DIR]).strip()
-
-        def load_hist(od: str) -> Any:
-            return gr.Dataframe(
-                value=_hist_rows_from_summary(od or DEFAULT_OUT),
-                headers=["started", "strategy", "mode", "voxels", "elapsed_s", "dir"],
-                interactive=False,
+        with gr.Row():
+            hist_dd = gr.Dropdown(
+                choices=_hist_choices(DEFAULT_OUT),
+                label="Select a past run",
+                value=None,
+                scale=4,
             )
+            hist_refresh_btn = gr.Button("Refresh", scale=1)
+            load_hist_btn = gr.Button("Load selected run", variant="secondary", scale=1)
+
+        def refresh_hist(od: str) -> Any:
+            choices = _hist_choices(od)
+            return gr.Dropdown(choices=choices, value=choices[0][1] if choices else None)
 
         def load_selected_run(
-            run_dir: str,
+            run_dir: Optional[str],
             logbox: str,
         ) -> Iterator[Tuple[str, Any, Any, Any, Any]]:
             log = logbox or ""
             run_dir = (run_dir or "").strip()
             if not run_dir:
-                log += "\n[History] Click a row in the table first, then Load selected run.\n"
+                log += "\n[History] Select a run from the dropdown first.\n"
                 yield log, gr.update(), gr.update(), gr.update(), gr.update()
                 return
             if not os.path.isdir(run_dir):
@@ -691,11 +666,10 @@ def main() -> None:
                 yield log, prev, None, tbl_out, info
             yield log, prev, model, tbl_out, info
 
-        hist_btn.click(load_hist, inputs=[out_dir], outputs=[hist_tbl])
-        hist_tbl.select(on_hist_select, inputs=[hist_tbl], outputs=[hist_selected_dir])
+        hist_refresh_btn.click(refresh_hist, inputs=[out_dir], outputs=[hist_dd])
         load_hist_btn.click(
             load_selected_run,
-            inputs=[hist_selected_dir, log_out],
+            inputs=[hist_dd, log_out],
             outputs=[log_out, prev_img, glb_out, stage_tbl, summ_json],
         )
 

@@ -103,7 +103,7 @@ def main() -> int:
 
         with log_step("extract silhouettes (raw, pipeline.rembg)") as t:
             scaffold_masks = [
-                extract_silhouette_rembg(rm, raw) for raw in raw_images
+                extract_silhouette_rembg(rm, raw, pipeline) for raw in raw_images
             ]
         for i, m in enumerate(scaffold_masks):
             print(

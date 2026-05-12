@@ -149,8 +149,17 @@ def preprocess_image_standalone(raw_img: Image.Image, rembg_model) -> Image.Imag
     return Image.fromarray((out_np * 255).astype(np.uint8))
 
 
-def extract_silhouette_rembg(rembg_model, raw_rgb: Image.Image) -> np.ndarray:
+def extract_silhouette_rembg(
+    rembg_model,
+    raw_rgb: Image.Image,
+    pipeline: Optional[Any] = None,
+) -> np.ndarray:
+    low_vram = pipeline is not None and getattr(pipeline, "low_vram", False)
+    if low_vram:
+        rembg_model.to(pipeline.device)
     rgba = rembg_model(raw_rgb.convert("RGB"))
+    if low_vram:
+        rembg_model.cpu()
     return np.array(rgba)[:, :, 3] > 0
 
 
