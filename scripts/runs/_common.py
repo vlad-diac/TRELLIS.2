@@ -371,13 +371,14 @@ def run_stages_3_to_5(
         torch.cuda.empty_cache()
         with log_step("decode + export (geometry-only)", 5, 5) as t:
             meshes, _ = pipeline.decode_shape_slat(shape_slat, res)
+            del shape_slat
+            torch.cuda.empty_cache()
             meshes[0].fill_holes()
             if args.obj:
                 model_path = save_obj(meshes[0], run_dir)
             else:
                 model_path = save_geometry_glb(meshes[0], run_dir)
         stage_times["decode_s"] = round(t[0], 2)
-        del shape_slat
     else:
         cond_tex = cond_1024 if cond_1024 is not None else cond_512
         flow_tex = (

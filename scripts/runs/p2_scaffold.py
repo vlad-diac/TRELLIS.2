@@ -19,14 +19,11 @@ from _common import (
     extract_silhouette_rembg,
     gpu_mem_str,
     load_pipeline,
-    load_rembg_model,
     log_step,
-    preprocess_image_standalone,
     print_banner,
     resolve_run_dir,
     sparse_grid_resolution,
     unload_pipeline,
-    unload_rembg_model,
     write_summary,
 )
 
@@ -71,14 +68,6 @@ def main() -> int:
     n = len(args.images)
     raw_images = [Image.open(p).convert("RGB") for p in args.images]
 
-    print_banner("Phase 1 — BiRefNet preprocess + hull")
-    with log_step(f"[LOAD] BiRefNet ({args.rembg_model})") as t:
-        rembg_model = load_rembg_model(args.rembg_model)
-    print(f"       {gpu_mem_str()}")
-
-    with log_step(f"preprocess {n} image(s)") as t:
-        images = [preprocess_image_standalone(img, rembg_model) for img in raw_images]
-
     if args.azimuths is not None:
         if len(args.azimuths) != n:
             raise ValueError(
@@ -87,34 +76,6 @@ def main() -> int:
         azimuths = list(args.azimuths)
     else:
         azimuths = [360.0 * i / n for i in range(n)]
-        print(f"       auto azimuths: {[f'{a:.1f}°' for a in azimuths]}")
-
-    with log_step("extract silhouettes (raw)") as t:
-        scaffold_masks = [extract_silhouette_rembg(rembg_model, raw) for raw in raw_images]
-
-    rotations = [make_look_at_rotation(az, args.elevation) for az in azimuths]
-    ss_res = sparse_grid_resolution(args.pipeline)
-    min_views = args.min_views_scaffold if args.min_views_scaffold is not None else len(scaffold_masks)
-
-    with log_step(f"space carve (grid={ss_res}³, min_views={min_views})") as t:
-        occupancy = space_carve(
-            scaffold_masks, rotations, grid_size=ss_res, min_views=min_views
-        )
-    n_occ = int(occupancy.sum())
-    density = 100 * n_occ / occupancy.size
-    print(f"       {n_occ:,} / {occupancy.size:,} voxels ({density:.1f}% density)")
-
-    with log_step("[UNLOAD] BiRefNet") as t:
-        unload_rembg_model(rembg_model)
-    print("       GPU memory cleared")
-
-    scaffold_info = {
-        "grid_size": ss_res,
-        "min_views": min_views,
-        "occupied_voxels": n_occ,
-        "total_voxels": int(occupancy.size),
-        "density_pct": round(density, 2),
-    }
 
     t_wall0 = time.time()
     stage_times: dict = {}
@@ -124,12 +85,67 @@ def main() -> int:
     model_path = None
     preview_path = None
     coords = None
+    scaffold_info: dict = {}
 
     try:
+        print_banner("Phase 1 — load pipeline + hull + preprocess")
         with log_step(f"[LOAD] {args.model}") as t:
             pipeline = load_pipeline(args.model)
         print(f"       {gpu_mem_str()}")
         stage_times["load_s"] = round(t[0], 2)
+
+        if args.azimuths is None:
+            print(f"       auto azimuths: {[f'{a:.1f}°' for a in azimuths]}")
+
+        rm = pipeline.rembg_model
+        if rm is None:
+            raise RuntimeError("Pipeline has no rembg_model; cannot build hull.")
+
+        with log_step("extract silhouettes (raw, pipeline.rembg)") as t:
+            scaffold_masks = [
+                extract_silhouette_rembg(rm, raw) for raw in raw_images
+            ]
+        for i, m in enumerate(scaffold_masks):
+            print(
+                f"       view {i}: {m.sum():,} foreground px "
+                f"({100 * m.mean():.1f}% of frame)"
+            )
+
+        with log_step(f"preprocess {n} image(s) (pipeline.rembg)") as t:
+            images = [pipeline.preprocess_image(img) for img in raw_images]
+
+        rotations = [make_look_at_rotation(az, args.elevation) for az in azimuths]
+        ss_res = sparse_grid_resolution(args.pipeline)
+        min_views = (
+            args.min_views_scaffold
+            if args.min_views_scaffold is not None
+            else len(scaffold_masks)
+        )
+
+        with log_step(f"space carve (grid={ss_res}³, min_views={min_views})") as t:
+            occupancy = space_carve(
+                scaffold_masks, rotations, grid_size=ss_res, min_views=min_views
+            )
+        n_occ = int(occupancy.sum())
+        density = 100 * n_occ / occupancy.size
+        print(f"       {n_occ:,} / {occupancy.size:,} voxels ({density:.1f}% density)")
+        if density > 80:
+            print(
+                "       [WARN] density >80% — hull may be nearly full. "
+                "Check azimuths or try --min-views-scaffold with a lower value."
+            )
+        scaffold_info = {
+            "grid_size": ss_res,
+            "min_views": min_views,
+            "occupied_voxels": n_occ,
+            "total_voxels": int(occupancy.size),
+            "density_pct": round(density, 2),
+        }
+
+        del scaffold_masks
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         from _common import run_p2_core
 
@@ -166,7 +182,7 @@ def main() -> int:
         "model_path": model_path,
         "preview_path": preview_path,
         "error": error,
-        "scaffold": scaffold_info,
+        "scaffold": scaffold_info if scaffold_info else None,
     }
     write_summary(run_dir, summary)
     print(f"Summary JSON : {os.path.join(run_dir, 'summary.json')}")

@@ -18,13 +18,10 @@ from _common import (
     copy_inputs_to_run_dir,
     gpu_mem_str,
     load_pipeline,
-    load_rembg_model,
     log_step,
-    preprocess_image_standalone,
     print_banner,
     resolve_run_dir,
     unload_pipeline,
-    unload_rembg_model,
     write_summary,
 )
 
@@ -60,16 +57,6 @@ def main() -> int:
 
     raw_images = [Image.open(p).convert("RGB") for p in args.images]
 
-    print_banner("Phase 1 — BiRefNet preprocess")
-    with log_step(f"[LOAD] BiRefNet ({args.rembg_model})") as t:
-        rembg_model = load_rembg_model(args.rembg_model)
-    print(f"       {gpu_mem_str()}")
-    with log_step(f"preprocess {len(raw_images)} image(s)") as t:
-        images = [preprocess_image_standalone(img, rembg_model) for img in raw_images]
-    with log_step("[UNLOAD] BiRefNet") as t:
-        unload_rembg_model(rembg_model)
-    print("       GPU memory cleared")
-
     t_wall0 = time.time()
     stage_times = {}
     pipeline = None
@@ -84,6 +71,9 @@ def main() -> int:
             pipeline = load_pipeline(args.model)
         print(f"       {gpu_mem_str()}")
         stage_times["load_s"] = round(t[0], 2)
+
+        with log_step(f"preprocess {len(raw_images)} image(s) (pipeline.rembg)") as t:
+            images = [pipeline.preprocess_image(img) for img in raw_images]
 
         from _common import run_p1_core
 
